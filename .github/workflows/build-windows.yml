@@ -1,0 +1,49 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configure x64 Release
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build-output.txt
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $errors = Get-Content build-output.txt | Where-Object {
+              $_ -match '(?i)(error\s+C\d+|fatal error|LNK\d+|error\s+MSB\d+|:\s*error\s+)'
+            }
+            if (-not $errors) {
+              $errors = Get-Content build-output.txt | Select-Object -Last 20
+            }
+            $errors | Select-Object -First 20 | ForEach-Object {
+              Write-Output ("::error::" + $_)
+            }
+            exit $code
+          }
+
+      - name: Run integration tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Upload standalone EXE
+        uses: actions/upload-artifact@v7
+        with:
+          name: FolderMTimeFix-windows-x64
+          path: build/Release/FolderMTimeFix.exe
+          if-no-files-found: error
