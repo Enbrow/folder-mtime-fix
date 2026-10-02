@@ -36,6 +36,11 @@ constexpr int IDC_SAVE = 1006;
 constexpr int IDC_LOG = 1007;
 constexpr int IDC_STATUS = 1008;
 constexpr int IDC_RULE = 1009;
+constexpr int IDC_CURRENT_LABEL = 1010;
+constexpr int IDC_CURRENT_LIST = 1011;
+constexpr int IDC_TARGET_LABEL = 1012;
+constexpr int IDC_TARGET_LIST = 1013;
+constexpr int IDC_LOG_LABEL = 1014;
 
 HWND gPath = nullptr;
 HWND gBrowse = nullptr;
@@ -46,7 +51,13 @@ HWND gSave = nullptr;
 HWND gLog = nullptr;
 HWND gStatus = nullptr;
 HWND gRule = nullptr;
+HWND gCurrentLabel = nullptr;
+HWND gCurrentList = nullptr;
+HWND gTargetLabel = nullptr;
+HWND gTargetList = nullptr;
+HWND gLogLabel = nullptr;
 HFONT gFont = nullptr;
+HFONT gMonoFont = nullptr;
 std::wstring gLastLog;
 std::wstring gLastRoot;
 
@@ -73,6 +84,26 @@ void SetControlsEnabled(bool enabled) {
     EnableWindow(gApply, enabled);
     EnableWindow(gCopy, enabled && !gLastLog.empty());
     EnableWindow(gSave, enabled && !gLastLog.empty());
+}
+
+int ScaleForDpi(HWND hwnd, int value) {
+    UINT dpi = GetDpiForWindow(hwnd);
+    if (dpi == 0) {
+        dpi = 96;
+    }
+    return MulDiv(value, static_cast<int>(dpi), 96);
+}
+
+HFONT CreateAppFont(HWND hwnd, const wchar_t* face, int pointSize, int weight = FW_NORMAL) {
+    UINT dpi = GetDpiForWindow(hwnd);
+    if (dpi == 0) {
+        dpi = 96;
+    }
+    return CreateFontW(
+        -MulDiv(pointSize, static_cast<int>(dpi), 72),
+        0, 0, 0, weight, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
 }
 
 std::wstring ToExtendedPathForApi(const std::wstring& input) {
@@ -313,6 +344,132 @@ void SaveLogAs(HWND owner) {
     SetStatus(L"日志已保存到：" + destination);
 }
 
+std::wstring TimeText(bool hasTime, const FILETIME& time) {
+    if (!hasTime) {
+        return L"—";
+    }
+    std::wstring text = fmtfix::FormatFileTimeLocal(time);
+    // The tables favor readability; the detailed log keeps full precision.
+    if (text.size() > 19 && text[4] == L'-' && text[10] == L' ') {
+        text.resize(19);
+    }
+    return text;
+}
+
+void AddListColumn(HWND list, int index, const wchar_t* title) {
+    LVCOLUMNW column{};
+    column.mask = LVCF_TEXT | LVCF_SUBITEM;
+    column.iSubItem = index;
+    column.pszText = const_cast<LPWSTR>(title);
+    ListView_InsertColumn(list, index, &column);
+}
+
+void AddListRow(HWND list,
+                const std::wstring& first,
+                const std::wstring& second,
+                const std::wstring& third) {
+    LVITEMW item{};
+    item.mask = LVIF_TEXT;
+    item.iItem = ListView_GetItemCount(list);
+    item.iSubItem = 0;
+    item.pszText = const_cast<LPWSTR>(first.c_str());
+    const int row = ListView_InsertItem(list, &item);
+    if (row >= 0) {
+        ListView_SetItemText(list, row, 1, const_cast<LPWSTR>(second.c_str()));
+        ListView_SetItemText(list, row, 2, const_cast<LPWSTR>(third.c_str()));
+    }
+}
+
+void ClearComparisonViews() {
+    if (gCurrentList != nullptr) {
+        ListView_DeleteAllItems(gCurrentList);
+    }
+    if (gTargetList != nullptr) {
+        ListView_DeleteAllItems(gTargetList);
+    }
+    SetWindowTextW(gCurrentLabel, L"当前状态 / 参考来源");
+    SetWindowTextW(gTargetLabel, L"变更预览");
+}
+
+void PopulateComparisonViews(const fmtfix::Result& result) {
+    SendMessageW(gCurrentList, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(gTargetList, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(gCurrentList);
+    ListView_DeleteAllItems(gTargetList);
+
+    size_t sourceRows = 0;
+    size_t changeRows = 0;
+
+    for (const auto& entry : result.entries) {
+        AddListRow(
+            gCurrentList,
+            L"文件夹",
+            entry.directory,
+            TimeText(entry.hasBefore, entry.before));
+
+        if (!entry.sourcePath.empty() && entry.hasTarget) {
+            const bool sourceIsFile = entry.sourceType == L"file";
+            const std::wstring type =
+                sourceIsFile ? L"↳ 参考文件" : L"↳ 参考目录";
+
+            FILETIME sourceOriginal = entry.target;
+            bool hasSourceOriginal = true;
+            if (!sourceIsFile) {
+                hasSourceOriginal = false;
+                for (const auto& candidate : result.entries) {
+                    if (candidate.directory == entry.sourcePath && candidate.hasBefore) {
+                        sourceOriginal = candidate.before;
+                        hasSourceOriginal = true;
+                        break;
+                    }
+                }
+            }
+
+            AddListRow(
+                gCurrentList,
+                type,
+                entry.sourcePath,
+                TimeText(hasSourceOriginal, sourceOriginal));
+            ++sourceRows;
+        }
+
+        if (entry.status == fmtfix::EntryStatus::WouldChange ||
+            entry.status == fmtfix::EntryStatus::Changed) {
+            AddListRow(
+                gTargetList,
+                entry.directory,
+                TimeText(entry.hasBefore, entry.before),
+                TimeText(entry.hasTarget, entry.target));
+            ++changeRows;
+        }
+    }
+
+    if (changeRows == 0) {
+        AddListRow(gTargetList, L"（没有需要修改的目录）", L"", L"");
+    }
+
+    std::wstringstream leftTitle;
+    leftTitle << L"当前状态 / 参考来源（"
+              << result.entries.size() << L" 个目录";
+    if (sourceRows > 0) {
+        leftTitle << L"，" << sourceRows << L" 个参考对象";
+    }
+    leftTitle << L"）";
+    SetWindowTextW(gCurrentLabel, leftTitle.str().c_str());
+
+    std::wstringstream rightTitle;
+    rightTitle << (result.mode == fmtfix::Mode::DryRun
+                       ? L"Dry Run 变更预览"
+                       : L"已应用的修改")
+               << L"（" << changeRows << L" 项）";
+    SetWindowTextW(gTargetLabel, rightTitle.str().c_str());
+
+    SendMessageW(gCurrentList, WM_SETREDRAW, TRUE, 0);
+    SendMessageW(gTargetList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(gCurrentList, nullptr, TRUE);
+    InvalidateRect(gTargetList, nullptr, TRUE);
+}
+
 void RunOperation(HWND owner, fmtfix::Mode mode) {
     std::wstring pathText = GetWindowTextString(gPath);
     std::wstring pathError;
@@ -338,6 +495,7 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
     }
 
     SetControlsEnabled(false);
+    ClearComparisonViews();
     SetWindowTextW(gLog, L"");
     SetStatus(mode == fmtfix::Mode::DryRun ? L"正在预览，请稍候..." : L"正在修改，请稍候...");
     UpdateWindow(owner);
@@ -345,9 +503,7 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
     const fmtfix::Result result = fmtfix::ProcessTree(root, mode);
     gLastRoot = root;
     gLastLog = fmtfix::FormatLog(result);
-    SetWindowTextW(gLog, gLastLog.c_str());
-
-    SetControlsEnabled(true);
+    PopulateComparisonViews(result);
 
     std::wstringstream summary;
     summary << (mode == fmtfix::Mode::DryRun ? L"Dry Run 完成" : L"应用完成")
@@ -356,8 +512,12 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
             << L"，未变化 " << result.summary.unchanged
             << L"，空目录 " << result.summary.skipped
             << L"，错误 " << result.summary.errors << L"。";
+
     const std::wstring logStatus = AutoSaveTempLog(root);
-    SetStatus(summary.str() + L"  " + logStatus);
+    gLastLog += L"\r\n# " + logStatus + L"\r\n";
+    SetWindowTextW(gLog, gLastLog.c_str());
+    SetStatus(summary.str());
+    SetControlsEnabled(true);
 
     if (result.summary.errors > 0) {
         MessageBoxW(
@@ -369,10 +529,55 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
     }
 }
 
-void ApplyFont(HWND hwnd) {
-    if (gFont != nullptr) {
-        SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+void ApplyFont(HWND hwnd, HFONT font) {
+    if (hwnd != nullptr && font != nullptr) {
+        SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     }
+}
+
+void RefreshFonts(HWND hwnd) {
+    HFONT oldFont = gFont;
+    HFONT oldMonoFont = gMonoFont;
+
+    gFont = CreateAppFont(hwnd, L"Segoe UI", 10);
+    gMonoFont = CreateAppFont(hwnd, L"Consolas", 9);
+
+    for (HWND child : {
+             gRule, gPath, gBrowse, gDryRun, gApply, gCopy, gSave, gStatus,
+             gCurrentLabel, gCurrentList, gTargetLabel, gTargetList, gLogLabel}) {
+        ApplyFont(child, gFont);
+    }
+    ApplyFont(gLog, gMonoFont != nullptr ? gMonoFont : gFont);
+
+    if (oldFont != nullptr) {
+        DeleteObject(oldFont);
+    }
+    if (oldMonoFont != nullptr) {
+        DeleteObject(oldMonoFont);
+    }
+}
+
+void ResizeListColumns(HWND hwnd, int leftWidth, int rightWidth) {
+    if (gCurrentList == nullptr || gTargetList == nullptr) {
+        return;
+    }
+
+    const int typeWidth = ScaleForDpi(hwnd, 84);
+    const int timeWidth = ScaleForDpi(hwnd, 154);
+    const int minPathWidth = ScaleForDpi(hwnd, 150);
+    const int innerPad = ScaleForDpi(hwnd, 10);
+
+    const int leftPathWidth =
+        std::max(minPathWidth, leftWidth - typeWidth - timeWidth - innerPad);
+    ListView_SetColumnWidth(gCurrentList, 0, typeWidth);
+    ListView_SetColumnWidth(gCurrentList, 1, leftPathWidth);
+    ListView_SetColumnWidth(gCurrentList, 2, timeWidth);
+
+    const int rightPathWidth =
+        std::max(minPathWidth, rightWidth - timeWidth * 2 - innerPad);
+    ListView_SetColumnWidth(gTargetList, 0, rightPathWidth);
+    ListView_SetColumnWidth(gTargetList, 1, timeWidth);
+    ListView_SetColumnWidth(gTargetList, 2, timeWidth);
 }
 
 void LayoutControls(HWND hwnd) {
@@ -380,44 +585,83 @@ void LayoutControls(HWND hwnd) {
     GetClientRect(hwnd, &rc);
     const int w = rc.right - rc.left;
     const int h = rc.bottom - rc.top;
-    const int margin = 14;
-    const int rowH = 30;
-    const int buttonW = 110;
-    const int gap = 8;
+
+    const int margin = ScaleForDpi(hwnd, 16);
+    const int gap = ScaleForDpi(hwnd, 10);
+    const int splitGap = ScaleForDpi(hwnd, 12);
+    const int rowH = ScaleForDpi(hwnd, 34);
+    const int ruleH = ScaleForDpi(hwnd, 48);
+    const int labelH = ScaleForDpi(hwnd, 24);
+    const int statusH = ScaleForDpi(hwnd, 28);
+    const int browseW = ScaleForDpi(hwnd, 136);
 
     int y = margin;
-    MoveWindow(gRule, margin, y, w - margin * 2, 42, TRUE);
-    y += 50;
+    MoveWindow(gRule, margin, y, std::max(1, w - margin * 2), ruleH, TRUE);
+    y += ruleH + gap;
 
-    MoveWindow(gPath, margin, y, w - margin * 2 - buttonW - gap, rowH, TRUE);
-    MoveWindow(gBrowse, w - margin - buttonW, y, buttonW, rowH, TRUE);
-    y += rowH + 10;
+    MoveWindow(
+        gPath, margin, y,
+        std::max(1, w - margin * 2 - browseW - gap), rowH, TRUE);
+    MoveWindow(gBrowse, w - margin - browseW, y, browseW, rowH, TRUE);
+    y += rowH + gap;
 
-    MoveWindow(gDryRun, margin, y, 130, rowH, TRUE);
-    MoveWindow(gApply, margin + 138, y, 130, rowH, TRUE);
-    MoveWindow(gCopy, margin + 276, y, 110, rowH, TRUE);
-    MoveWindow(gSave, margin + 394, y, 110, rowH, TRUE);
-    y += rowH + 10;
+    int x = margin;
+    const int dryW = ScaleForDpi(hwnd, 144);
+    const int applyW = ScaleForDpi(hwnd, 124);
+    const int copyW = ScaleForDpi(hwnd, 116);
+    const int saveW = ScaleForDpi(hwnd, 124);
+    MoveWindow(gDryRun, x, y, dryW, rowH, TRUE);
+    x += dryW + gap;
+    MoveWindow(gApply, x, y, applyW, rowH, TRUE);
+    x += applyW + gap;
+    MoveWindow(gCopy, x, y, copyW, rowH, TRUE);
+    x += copyW + gap;
+    MoveWindow(gSave, x, y, saveW, rowH, TRUE);
+    y += rowH + gap;
 
-    MoveWindow(gStatus, margin, y, w - margin * 2, 24, TRUE);
-    y += 30;
+    MoveWindow(gStatus, margin, y, std::max(1, w - margin * 2), statusH, TRUE);
+    y += statusH + gap;
 
-    MoveWindow(gLog, margin, y, w - margin * 2, std::max(80, h - y - margin), TRUE);
+    const int contentBottom = std::max(y, h - margin);
+    const int availableH = std::max(ScaleForDpi(hwnd, 260), contentBottom - y);
+    const int logMinH = ScaleForDpi(hwnd, 150);
+    const int listMinH = ScaleForDpi(hwnd, 150);
+    int logH = std::max(logMinH, availableH * 32 / 100);
+    int listH = availableH - labelH * 2 - gap - logH;
+    if (listH < listMinH) {
+        listH = listMinH;
+        logH = std::max(ScaleForDpi(hwnd, 90),
+                        availableH - labelH * 2 - gap - listH);
+    }
+
+    const int contentW = std::max(1, w - margin * 2);
+    const int leftW = std::max(1, (contentW - splitGap) / 2);
+    const int rightW = std::max(1, contentW - splitGap - leftW);
+
+    MoveWindow(gCurrentLabel, margin, y, leftW, labelH, TRUE);
+    MoveWindow(gTargetLabel, margin + leftW + splitGap, y, rightW, labelH, TRUE);
+    y += labelH;
+
+    MoveWindow(gCurrentList, margin, y, leftW, listH, TRUE);
+    MoveWindow(gTargetList, margin + leftW + splitGap, y, rightW, listH, TRUE);
+    ResizeListColumns(hwnd, leftW, rightW);
+    y += listH + gap;
+
+    MoveWindow(gLogLabel, margin, y, contentW, labelH, TRUE);
+    y += labelH;
+
+    MoveWindow(
+        gLog, margin, y, contentW,
+        std::max(ScaleForDpi(hwnd, 80), h - margin - y), TRUE);
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
-        NONCLIENTMETRICSW metrics{};
-        metrics.cbSize = sizeof(metrics);
-        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
-            gFont = CreateFontIndirectW(&metrics.lfMessageFont);
-        }
-
         gRule = CreateWindowExW(
             0, L"STATIC",
-            L"规则：有直属文件时使用最新直属文件时间；没有直属文件时才参考直属子目录。"
-            L"空目录不修改；忽略 .git 等点开头项目及 Junction/符号链接。",
+            L"规则：有直属文件 → 取最新直属文件时间；无直属文件 → 取最新直属子目录的处理后时间。\r\n"
+            L"空目录不修改；忽略 .git 等点开头项目及 Junction / 符号链接。",
             WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_RULE), nullptr, nullptr);
 
@@ -456,6 +700,52 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
 
+        gCurrentLabel = CreateWindowExW(
+            0, L"STATIC", L"当前状态 / 参考来源",
+            WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_CURRENT_LABEL), nullptr, nullptr);
+
+        gTargetLabel = CreateWindowExW(
+            0, L"STATIC", L"变更预览",
+            WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_TARGET_LABEL), nullptr, nullptr);
+
+        const DWORD listStyle =
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+            LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS;
+
+        gCurrentList = CreateWindowExW(
+            WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            listStyle,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_CURRENT_LIST), nullptr, nullptr);
+
+        gTargetList = CreateWindowExW(
+            WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            listStyle,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_TARGET_LIST), nullptr, nullptr);
+
+        const DWORD listExtendedStyle =
+            LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER;
+        ListView_SetExtendedListViewStyle(gCurrentList, listExtendedStyle);
+        ListView_SetExtendedListViewStyle(gTargetList, listExtendedStyle);
+
+        AddListColumn(gCurrentList, 0, L"类型");
+        AddListColumn(gCurrentList, 1, L"路径");
+        AddListColumn(gCurrentList, 2, L"原修改时间");
+        AddListColumn(gTargetList, 0, L"目录");
+        AddListColumn(gTargetList, 1, L"修改前");
+        AddListColumn(gTargetList, 2, L"修改后");
+
+        gLogLabel = CreateWindowExW(
+            0, L"STATIC", L"详细日志",
+            WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_LOG_LABEL), nullptr, nullptr);
+
         gLog = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
@@ -463,9 +753,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_LOG), nullptr, nullptr);
         SendMessageW(gLog, EM_SETLIMITTEXT, 50u * 1024u * 1024u, 0);
 
-        for (HWND child : {gRule, gPath, gBrowse, gDryRun, gApply, gCopy, gSave, gStatus, gLog}) {
-            ApplyFont(child);
-        }
+        RefreshFonts(hwnd);
 
         // Start with the current working directory as a convenience.
         DWORD needed = GetCurrentDirectoryW(0, nullptr);
@@ -485,6 +773,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_SIZE:
         LayoutControls(hwnd);
         return 0;
+
+    case WM_GETMINMAXINFO: {
+        auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+        info->ptMinTrackSize.x = ScaleForDpi(hwnd, 900);
+        info->ptMinTrackSize.y = ScaleForDpi(hwnd, 680);
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+        SetWindowPos(
+            hwnd, nullptr,
+            suggested->left, suggested->top,
+            suggested->right - suggested->left,
+            suggested->bottom - suggested->top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        RefreshFonts(hwnd);
+        LayoutControls(hwnd);
+        return 0;
+    }
 
     case WM_COMMAND: {
         const int id = LOWORD(wParam);
@@ -519,6 +827,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             DeleteObject(gFont);
             gFont = nullptr;
         }
+        if (gMonoFont != nullptr) {
+            DeleteObject(gMonoFont);
+            gMonoFont = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -531,7 +843,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     INITCOMMONCONTROLSEX controls{};
     controls.dwSize = sizeof(controls);
-    controls.dwICC = ICC_STANDARD_CLASSES;
+    controls.dwICC = ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&controls);
 
     HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -560,8 +872,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        980,
-        700,
+        1180,
+        820,
         nullptr,
         nullptr,
         instance,
