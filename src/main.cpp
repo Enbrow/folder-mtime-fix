@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -37,10 +39,13 @@ constexpr int IDC_LOG = 1007;
 constexpr int IDC_STATUS = 1008;
 constexpr int IDC_RULE = 1009;
 constexpr int IDC_CURRENT_LABEL = 1010;
-constexpr int IDC_CURRENT_LIST = 1011;
+constexpr int IDC_CURRENT_TREE = 1011;
 constexpr int IDC_TARGET_LABEL = 1012;
-constexpr int IDC_TARGET_LIST = 1013;
+constexpr int IDC_CHANGE_LIST = 1013;
 constexpr int IDC_LOG_LABEL = 1014;
+constexpr int IDC_TARGET_TREE = 1015;
+constexpr int IDC_MODE_CHANGES = 1016;
+constexpr int IDC_MODE_TREE = 1017;
 
 HWND gPath = nullptr;
 HWND gBrowse = nullptr;
@@ -52,14 +57,24 @@ HWND gLog = nullptr;
 HWND gStatus = nullptr;
 HWND gRule = nullptr;
 HWND gCurrentLabel = nullptr;
-HWND gCurrentList = nullptr;
+HWND gCurrentTree = nullptr;
 HWND gTargetLabel = nullptr;
-HWND gTargetList = nullptr;
+HWND gChangeList = nullptr;
+HWND gTargetTree = nullptr;
+HWND gModeChanges = nullptr;
+HWND gModeTree = nullptr;
 HWND gLogLabel = nullptr;
 HFONT gFont = nullptr;
 HFONT gMonoFont = nullptr;
 std::wstring gLastLog;
 std::wstring gLastRoot;
+bool gTreePreviewMode = false;
+bool gSyncingTrees = false;
+std::map<std::wstring, HTREEITEM> gLeftTreeItems;
+std::map<std::wstring, HTREEITEM> gRightTreeItems;
+std::map<HTREEITEM, std::wstring> gLeftItemPaths;
+std::map<HTREEITEM, std::wstring> gRightItemPaths;
+std::set<HTREEITEM> gRightChangedItems;
 
 std::wstring GetWindowTextString(HWND hwnd) {
     const int len = GetWindowTextLengthW(hwnd);
@@ -380,79 +395,289 @@ void AddListRow(HWND list,
     }
 }
 
+std::wstring ParentPath(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) {
+        return {};
+    }
+    if (slash == 2 && path.size() >= 3 && path[1] == L':') {
+        return path.substr(0, 3);
+    }
+    if (slash == 0) {
+        return path.substr(0, 1);
+    }
+    return path.substr(0, slash);
+}
+
+std::wstring LeafName(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos || slash + 1 >= path.size()) {
+        return path;
+    }
+    return path.substr(slash + 1);
+}
+
+bool EntryChangesTime(const fmtfix::LogEntry& entry) {
+    return entry.status == fmtfix::EntryStatus::WouldChange ||
+           entry.status == fmtfix::EntryStatus::Changed;
+}
+
+FILETIME EffectiveAfterTime(const fmtfix::LogEntry& entry, bool& hasTime) {
+    if (entry.hasAfter) {
+        hasTime = true;
+        return entry.after;
+    }
+    if (entry.hasTarget) {
+        hasTime = true;
+        return entry.target;
+    }
+    hasTime = entry.hasBefore;
+    return entry.before;
+}
+
+std::wstring TreeTimeLabel(const std::wstring& name,
+                           bool hasTime,
+                           const FILETIME& time,
+                           const std::wstring& suffix = L"") {
+    std::wstring text = name + L"    —    " + TimeText(hasTime, time);
+    if (!suffix.empty()) {
+        text += L"    " + suffix;
+    }
+    return text;
+}
+
+HTREEITEM InsertTreeNode(HWND tree,
+                         HTREEITEM parent,
+                         const std::wstring& text,
+                         const std::wstring& path,
+                         bool rightTree,
+                         bool changed) {
+    TVINSERTSTRUCTW insert{};
+    insert.hParent = parent;
+    insert.hInsertAfter = TVI_SORT;
+    insert.item.mask = TVIF_TEXT | TVIF_PARAM;
+    insert.item.pszText = const_cast<LPWSTR>(text.c_str());
+    insert.item.lParam = 0;
+
+    if (changed) {
+        insert.item.mask |= TVIF_STATE;
+        insert.item.stateMask = TVIS_BOLD;
+        insert.item.state = TVIS_BOLD;
+    }
+
+    HTREEITEM item = TreeView_InsertItem(tree, &insert);
+    if (item == nullptr) {
+        return nullptr;
+    }
+
+    if (rightTree) {
+        gRightTreeItems[path] = item;
+        gRightItemPaths[item] = path;
+        if (changed) {
+            gRightChangedItems.insert(item);
+        }
+    } else {
+        gLeftTreeItems[path] = item;
+        gLeftItemPaths[item] = path;
+    }
+    return item;
+}
+
+void ExpandTreeAncestors(HWND tree, HTREEITEM item) {
+    for (HTREEITEM parent = TreeView_GetParent(tree, item);
+         parent != nullptr;
+         parent = TreeView_GetParent(tree, parent)) {
+        TreeView_Expand(tree, parent, TVE_EXPAND);
+    }
+}
+
+void UpdatePreviewModeVisibility() {
+    if (gModeChanges != nullptr && gModeTree != nullptr) {
+        CheckRadioButton(
+            GetParent(gModeChanges),
+            IDC_MODE_CHANGES,
+            IDC_MODE_TREE,
+            gTreePreviewMode ? IDC_MODE_TREE : IDC_MODE_CHANGES);
+    }
+    if (gChangeList != nullptr) {
+        ShowWindow(gChangeList, gTreePreviewMode ? SW_HIDE : SW_SHOW);
+    }
+    if (gTargetTree != nullptr) {
+        ShowWindow(gTargetTree, gTreePreviewMode ? SW_SHOW : SW_HIDE);
+    }
+}
+
 void ClearComparisonViews() {
-    if (gCurrentList != nullptr) {
-        ListView_DeleteAllItems(gCurrentList);
+    if (gCurrentTree != nullptr) {
+        TreeView_DeleteAllItems(gCurrentTree);
     }
-    if (gTargetList != nullptr) {
-        ListView_DeleteAllItems(gTargetList);
+    if (gTargetTree != nullptr) {
+        TreeView_DeleteAllItems(gTargetTree);
     }
-    SetWindowTextW(gCurrentLabel, L"当前状态 / 参考来源");
-    SetWindowTextW(gTargetLabel, L"变更预览");
+    if (gChangeList != nullptr) {
+        ListView_DeleteAllItems(gChangeList);
+    }
+
+    gLeftTreeItems.clear();
+    gRightTreeItems.clear();
+    gLeftItemPaths.clear();
+    gRightItemPaths.clear();
+    gRightChangedItems.clear();
+
+    SetWindowTextW(gCurrentLabel, L"当前目录树 / 参考来源");
+    SetWindowTextW(gTargetLabel, L"Dry Run 变更预览");
 }
 
 void PopulateComparisonViews(const fmtfix::Result& result) {
-    SendMessageW(gCurrentList, WM_SETREDRAW, FALSE, 0);
-    SendMessageW(gTargetList, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(gCurrentList);
-    ListView_DeleteAllItems(gTargetList);
+    SendMessageW(gCurrentTree, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(gTargetTree, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(gChangeList, WM_SETREDRAW, FALSE, 0);
 
-    size_t sourceRows = 0;
-    size_t changeRows = 0;
+    ClearComparisonViews();
 
+    std::set<std::wstring> referencedDirectories;
     for (const auto& entry : result.entries) {
-        AddListRow(
-            gCurrentList,
-            L"文件夹",
-            entry.directory,
-            TimeText(entry.hasBefore, entry.before));
+        if (entry.sourceType == L"directory" && !entry.sourcePath.empty()) {
+            referencedDirectories.insert(entry.sourcePath);
+        }
+    }
 
-        if (!entry.sourcePath.empty() && entry.hasTarget) {
-            const bool sourceIsFile = entry.sourceType == L"file";
-            const std::wstring type =
-                sourceIsFile ? L"↳ 参考文件" : L"↳ 参考目录";
-
-            FILETIME sourceOriginal = entry.target;
-            bool hasSourceOriginal = true;
-            if (!sourceIsFile) {
-                hasSourceOriginal = false;
-                for (const auto& candidate : result.entries) {
-                    if (candidate.directory == entry.sourcePath && candidate.hasBefore) {
-                        sourceOriginal = candidate.before;
-                        hasSourceOriginal = true;
-                        break;
-                    }
-                }
+    std::vector<const fmtfix::LogEntry*> directories;
+    directories.reserve(result.entries.size());
+    for (const auto& entry : result.entries) {
+        directories.push_back(&entry);
+    }
+    std::sort(
+        directories.begin(), directories.end(),
+        [](const fmtfix::LogEntry* a, const fmtfix::LogEntry* b) {
+            if (a->directory.size() != b->directory.size()) {
+                return a->directory.size() < b->directory.size();
             }
+            return a->directory < b->directory;
+        });
 
-            AddListRow(
-                gCurrentList,
-                type,
-                entry.sourcePath,
-                TimeText(hasSourceOriginal, sourceOriginal));
-            ++sourceRows;
+    size_t changeRows = 0;
+    size_t sourceFiles = 0;
+
+    for (const auto* entry : directories) {
+        HTREEITEM leftParent = TVI_ROOT;
+        HTREEITEM rightParent = TVI_ROOT;
+
+        if (entry->directory != result.root) {
+            const std::wstring parentPath = ParentPath(entry->directory);
+            auto leftIt = gLeftTreeItems.find(parentPath);
+            auto rightIt = gRightTreeItems.find(parentPath);
+            if (leftIt != gLeftTreeItems.end()) {
+                leftParent = leftIt->second;
+            }
+            if (rightIt != gRightTreeItems.end()) {
+                rightParent = rightIt->second;
+            }
         }
 
-        if (entry.status == fmtfix::EntryStatus::WouldChange ||
-            entry.status == fmtfix::EntryStatus::Changed) {
+        std::wstring name =
+            entry->directory == result.root ? result.root : LeafName(entry->directory);
+        std::wstring referenceSuffix;
+        if (referencedDirectories.count(entry->directory) != 0) {
+            referenceSuffix = L"[作为上级参考目录]";
+        }
+
+        const std::wstring leftText =
+            TreeTimeLabel(name, entry->hasBefore, entry->before, referenceSuffix);
+
+        bool hasAfter = false;
+        const FILETIME after = EffectiveAfterTime(*entry, hasAfter);
+        const bool changed = EntryChangesTime(*entry);
+        const std::wstring rightText = TreeTimeLabel(
+            name,
+            hasAfter,
+            after,
+            changed
+                ? (result.mode == fmtfix::Mode::DryRun
+                       ? L"[将修改]"
+                       : L"[已修改]")
+                : referenceSuffix);
+
+        HTREEITEM leftItem = InsertTreeNode(
+            gCurrentTree, leftParent, leftText, entry->directory, false, false);
+        HTREEITEM rightItem = InsertTreeNode(
+            gTargetTree, rightParent, rightText, entry->directory, true, changed);
+
+        if (changed) {
             AddListRow(
-                gTargetList,
-                entry.directory,
-                TimeText(entry.hasBefore, entry.before),
-                TimeText(entry.hasTarget, entry.target));
+                gChangeList,
+                entry->directory,
+                TimeText(entry->hasBefore, entry->before),
+                TimeText(entry->hasTarget, entry->target));
             ++changeRows;
+
+            if (leftItem != nullptr) {
+                ExpandTreeAncestors(gCurrentTree, leftItem);
+            }
+            if (rightItem != nullptr) {
+                ExpandTreeAncestors(gTargetTree, rightItem);
+            }
         }
+    }
+
+    std::set<std::wstring> addedSourceFiles;
+    for (const auto& entry : result.entries) {
+        if (entry.sourceType != L"file" ||
+            entry.sourcePath.empty() ||
+            !entry.hasTarget ||
+            addedSourceFiles.count(entry.sourcePath) != 0) {
+            continue;
+        }
+
+        const auto leftParentIt = gLeftTreeItems.find(entry.directory);
+        const auto rightParentIt = gRightTreeItems.find(entry.directory);
+        if (leftParentIt == gLeftTreeItems.end() ||
+            rightParentIt == gRightTreeItems.end()) {
+            continue;
+        }
+
+        const std::wstring fileText = TreeTimeLabel(
+            LeafName(entry.sourcePath),
+            true,
+            entry.target,
+            L"[参考文件]");
+
+        InsertTreeNode(
+            gCurrentTree,
+            leftParentIt->second,
+            fileText,
+            entry.sourcePath,
+            false,
+            false);
+        InsertTreeNode(
+            gTargetTree,
+            rightParentIt->second,
+            fileText,
+            entry.sourcePath,
+            true,
+            false);
+        addedSourceFiles.insert(entry.sourcePath);
+        ++sourceFiles;
     }
 
     if (changeRows == 0) {
-        AddListRow(gTargetList, L"（没有需要修改的目录）", L"", L"");
+        AddListRow(gChangeList, L"（没有需要修改的目录）", L"", L"");
+    }
+
+    auto leftRoot = gLeftTreeItems.find(result.root);
+    auto rightRoot = gRightTreeItems.find(result.root);
+    if (leftRoot != gLeftTreeItems.end()) {
+        TreeView_Expand(gCurrentTree, leftRoot->second, TVE_EXPAND);
+    }
+    if (rightRoot != gRightTreeItems.end()) {
+        TreeView_Expand(gTargetTree, rightRoot->second, TVE_EXPAND);
     }
 
     std::wstringstream leftTitle;
-    leftTitle << L"当前状态 / 参考来源（"
+    leftTitle << L"当前目录树（"
               << result.entries.size() << L" 个目录";
-    if (sourceRows > 0) {
-        leftTitle << L"，" << sourceRows << L" 个参考对象";
+    if (sourceFiles > 0) {
+        leftTitle << L"，" << sourceFiles << L" 个参考文件";
     }
     leftTitle << L"）";
     SetWindowTextW(gCurrentLabel, leftTitle.str().c_str());
@@ -460,14 +685,94 @@ void PopulateComparisonViews(const fmtfix::Result& result) {
     std::wstringstream rightTitle;
     rightTitle << (result.mode == fmtfix::Mode::DryRun
                        ? L"Dry Run 变更预览"
-                       : L"已应用的修改")
+                       : L"应用结果")
                << L"（" << changeRows << L" 项）";
     SetWindowTextW(gTargetLabel, rightTitle.str().c_str());
 
-    SendMessageW(gCurrentList, WM_SETREDRAW, TRUE, 0);
-    SendMessageW(gTargetList, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(gCurrentList, nullptr, TRUE);
-    InvalidateRect(gTargetList, nullptr, TRUE);
+    SendMessageW(gCurrentTree, WM_SETREDRAW, TRUE, 0);
+    SendMessageW(gTargetTree, WM_SETREDRAW, TRUE, 0);
+    SendMessageW(gChangeList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(gCurrentTree, nullptr, TRUE);
+    InvalidateRect(gTargetTree, nullptr, TRUE);
+    InvalidateRect(gChangeList, nullptr, TRUE);
+    UpdatePreviewModeVisibility();
+}
+
+bool FindCounterpartTreeItem(HWND sourceTree,
+                             HTREEITEM sourceItem,
+                             HWND& targetTree,
+                             HTREEITEM& targetItem) {
+    const bool sourceIsLeft = sourceTree == gCurrentTree;
+    const auto& sourceMap = sourceIsLeft ? gLeftItemPaths : gRightItemPaths;
+    const auto& targetMap = sourceIsLeft ? gRightTreeItems : gLeftTreeItems;
+
+    auto pathIt = sourceMap.find(sourceItem);
+    if (pathIt == sourceMap.end()) {
+        return false;
+    }
+
+    auto itemIt = targetMap.find(pathIt->second);
+    if (itemIt == targetMap.end()) {
+        return false;
+    }
+
+    targetTree = sourceIsLeft ? gTargetTree : gCurrentTree;
+    targetItem = itemIt->second;
+    return true;
+}
+
+void SyncTreeExpansion(HWND sourceTree, HTREEITEM sourceItem, UINT action) {
+    if (gSyncingTrees) {
+        return;
+    }
+
+    HWND targetTree = nullptr;
+    HTREEITEM targetItem = nullptr;
+    if (!FindCounterpartTreeItem(sourceTree, sourceItem, targetTree, targetItem)) {
+        return;
+    }
+
+    gSyncingTrees = true;
+    if (action == TVE_EXPAND || action == TVE_EXPANDPARTIAL) {
+        TreeView_Expand(targetTree, targetItem, TVE_EXPAND);
+    } else if (action == TVE_COLLAPSE) {
+        TreeView_Expand(targetTree, targetItem, TVE_COLLAPSE);
+    }
+    gSyncingTrees = false;
+}
+
+void SyncTreeSelection(HWND sourceTree, HTREEITEM sourceItem) {
+    if (gSyncingTrees || sourceItem == nullptr) {
+        return;
+    }
+
+    HWND targetTree = nullptr;
+    HTREEITEM targetItem = nullptr;
+    if (!FindCounterpartTreeItem(sourceTree, sourceItem, targetTree, targetItem)) {
+        return;
+    }
+
+    gSyncingTrees = true;
+    TreeView_SelectItem(targetTree, targetItem);
+    gSyncingTrees = false;
+}
+
+LRESULT HandleTargetTreeCustomDraw(NMTVCUSTOMDRAW* draw) {
+    if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) {
+        return CDRF_NOTIFYITEMDRAW;
+    }
+
+    if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+        HTREEITEM item =
+            reinterpret_cast<HTREEITEM>(draw->nmcd.dwItemSpec);
+        if (gRightChangedItems.count(item) != 0) {
+            draw->clrTextBk = RGB(255, 239, 184);
+            draw->clrText = RGB(145, 72, 0);
+        }
+        return CDRF_DODEFAULT;
+    }
+
+    return CDRF_DODEFAULT;
 }
 
 void RunOperation(HWND owner, fmtfix::Mode mode) {
@@ -544,10 +849,18 @@ void RefreshFonts(HWND hwnd) {
 
     for (HWND child : {
              gRule, gPath, gBrowse, gDryRun, gApply, gCopy, gSave, gStatus,
-             gCurrentLabel, gCurrentList, gTargetLabel, gTargetList, gLogLabel}) {
+             gCurrentLabel, gCurrentTree, gTargetLabel, gChangeList, gTargetTree,
+             gModeChanges, gModeTree, gLogLabel}) {
         ApplyFont(child, gFont);
     }
     ApplyFont(gLog, gMonoFont != nullptr ? gMonoFont : gFont);
+
+    if (gCurrentTree != nullptr) {
+        TreeView_SetItemHeight(gCurrentTree, ScaleForDpi(hwnd, 26));
+    }
+    if (gTargetTree != nullptr) {
+        TreeView_SetItemHeight(gTargetTree, ScaleForDpi(hwnd, 26));
+    }
 
     if (oldFont != nullptr) {
         DeleteObject(oldFont);
@@ -557,27 +870,20 @@ void RefreshFonts(HWND hwnd) {
     }
 }
 
-void ResizeListColumns(HWND hwnd, int leftWidth, int rightWidth) {
-    if (gCurrentList == nullptr || gTargetList == nullptr) {
+void ResizeChangeListColumns(HWND hwnd, int width) {
+    if (gChangeList == nullptr) {
         return;
     }
 
-    const int typeWidth = ScaleForDpi(hwnd, 84);
     const int timeWidth = ScaleForDpi(hwnd, 154);
-    const int minPathWidth = ScaleForDpi(hwnd, 150);
-    const int innerPad = ScaleForDpi(hwnd, 10);
+    const int minPathWidth = ScaleForDpi(hwnd, 180);
+    const int innerPad = ScaleForDpi(hwnd, 12);
+    const int pathWidth =
+        std::max(minPathWidth, width - timeWidth * 2 - innerPad);
 
-    const int leftPathWidth =
-        std::max(minPathWidth, leftWidth - typeWidth - timeWidth - innerPad);
-    ListView_SetColumnWidth(gCurrentList, 0, typeWidth);
-    ListView_SetColumnWidth(gCurrentList, 1, leftPathWidth);
-    ListView_SetColumnWidth(gCurrentList, 2, timeWidth);
-
-    const int rightPathWidth =
-        std::max(minPathWidth, rightWidth - timeWidth * 2 - innerPad);
-    ListView_SetColumnWidth(gTargetList, 0, rightPathWidth);
-    ListView_SetColumnWidth(gTargetList, 1, timeWidth);
-    ListView_SetColumnWidth(gTargetList, 2, timeWidth);
+    ListView_SetColumnWidth(gChangeList, 0, pathWidth);
+    ListView_SetColumnWidth(gChangeList, 1, timeWidth);
+    ListView_SetColumnWidth(gChangeList, 2, timeWidth);
 }
 
 void LayoutControls(HWND hwnd) {
@@ -639,12 +945,35 @@ void LayoutControls(HWND hwnd) {
     const int rightW = std::max(1, contentW - splitGap - leftW);
 
     MoveWindow(gCurrentLabel, margin, y, leftW, labelH, TRUE);
-    MoveWindow(gTargetLabel, margin + leftW + splitGap, y, rightW, labelH, TRUE);
+
+    const int rightX = margin + leftW + splitGap;
+    const int modeChangesW = ScaleForDpi(hwnd, 124);
+    const int modeTreeW = ScaleForDpi(hwnd, 112);
+    const int targetLabelW = std::max(
+        ScaleForDpi(hwnd, 120),
+        rightW - modeChangesW - modeTreeW - gap * 2);
+
+    MoveWindow(gTargetLabel, rightX, y, targetLabelW, labelH, TRUE);
+    MoveWindow(
+        gModeChanges,
+        rightX + rightW - modeChangesW - modeTreeW - gap,
+        y,
+        modeChangesW,
+        labelH,
+        TRUE);
+    MoveWindow(
+        gModeTree,
+        rightX + rightW - modeTreeW,
+        y,
+        modeTreeW,
+        labelH,
+        TRUE);
     y += labelH;
 
-    MoveWindow(gCurrentList, margin, y, leftW, listH, TRUE);
-    MoveWindow(gTargetList, margin + leftW + splitGap, y, rightW, listH, TRUE);
-    ResizeListColumns(hwnd, leftW, rightW);
+    MoveWindow(gCurrentTree, margin, y, leftW, listH, TRUE);
+    MoveWindow(gChangeList, rightX, y, rightW, listH, TRUE);
+    MoveWindow(gTargetTree, rightX, y, rightW, listH, TRUE);
+    ResizeChangeListColumns(hwnd, rightW);
     y += listH + gap;
 
     MoveWindow(gLogLabel, margin, y, contentW, labelH, TRUE);
@@ -701,44 +1030,63 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
 
         gCurrentLabel = CreateWindowExW(
-            0, L"STATIC", L"当前状态 / 参考来源",
+            0, L"STATIC", L"当前目录树 / 参考来源",
             WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(IDC_CURRENT_LABEL), nullptr, nullptr);
 
         gTargetLabel = CreateWindowExW(
-            0, L"STATIC", L"变更预览",
+            0, L"STATIC", L"Dry Run 变更预览",
             WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(IDC_TARGET_LABEL), nullptr, nullptr);
+
+        gModeChanges = CreateWindowExW(
+            0, L"BUTTON", L"仅显示变更",
+            WS_CHILD | WS_VISIBLE | WS_GROUP | BS_AUTORADIOBUTTON,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_MODE_CHANGES), nullptr, nullptr);
+
+        gModeTree = CreateWindowExW(
+            0, L"BUTTON", L"目录对照",
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_MODE_TREE), nullptr, nullptr);
+
+        const DWORD treeStyle =
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+            TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
+            TVS_SHOWSELALWAYS | TVS_DISABLEDRAGDROP;
+
+        gCurrentTree = CreateWindowExW(
+            WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
+            treeStyle,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_CURRENT_TREE), nullptr, nullptr);
+
+        gTargetTree = CreateWindowExW(
+            WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
+            treeStyle,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_TARGET_TREE), nullptr, nullptr);
 
         const DWORD listStyle =
             WS_CHILD | WS_VISIBLE | WS_TABSTOP |
             LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS;
 
-        gCurrentList = CreateWindowExW(
+        gChangeList = CreateWindowExW(
             WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
             listStyle,
             0, 0, 0, 0, hwnd,
-            reinterpret_cast<HMENU>(IDC_CURRENT_LIST), nullptr, nullptr);
-
-        gTargetList = CreateWindowExW(
-            WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-            listStyle,
-            0, 0, 0, 0, hwnd,
-            reinterpret_cast<HMENU>(IDC_TARGET_LIST), nullptr, nullptr);
+            reinterpret_cast<HMENU>(IDC_CHANGE_LIST), nullptr, nullptr);
 
         const DWORD listExtendedStyle =
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER;
-        ListView_SetExtendedListViewStyle(gCurrentList, listExtendedStyle);
-        ListView_SetExtendedListViewStyle(gTargetList, listExtendedStyle);
+        ListView_SetExtendedListViewStyle(gChangeList, listExtendedStyle);
 
-        AddListColumn(gCurrentList, 0, L"类型");
-        AddListColumn(gCurrentList, 1, L"路径");
-        AddListColumn(gCurrentList, 2, L"原修改时间");
-        AddListColumn(gTargetList, 0, L"目录");
-        AddListColumn(gTargetList, 1, L"修改前");
-        AddListColumn(gTargetList, 2, L"修改后");
+        AddListColumn(gChangeList, 0, L"即将修改的目录");
+        AddListColumn(gChangeList, 1, L"修改前");
+        AddListColumn(gChangeList, 2, L"修改后");
 
         gLogLabel = CreateWindowExW(
             0, L"STATIC", L"详细日志",
@@ -754,6 +1102,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SendMessageW(gLog, EM_SETLIMITTEXT, 50u * 1024u * 1024u, 0);
 
         RefreshFonts(hwnd);
+        UpdatePreviewModeVisibility();
 
         // Start with the current working directory as a convenience.
         DWORD needed = GetCurrentDirectoryW(0, nullptr);
@@ -816,8 +1165,52 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_SAVE:
             SaveLogAs(hwnd);
             return 0;
+        case IDC_MODE_CHANGES:
+            if (HIWORD(wParam) == BN_CLICKED) {
+                gTreePreviewMode = false;
+                UpdatePreviewModeVisibility();
+            }
+            return 0;
+        case IDC_MODE_TREE:
+            if (HIWORD(wParam) == BN_CLICKED) {
+                gTreePreviewMode = true;
+                UpdatePreviewModeVisibility();
+            }
+            return 0;
         default:
             break;
+        }
+        break;
+    }
+
+    case WM_NOTIFY: {
+        auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (header == nullptr) {
+            break;
+        }
+
+        if (header->hwndFrom == gCurrentTree ||
+            header->hwndFrom == gTargetTree) {
+            if (header->code == TVN_ITEMEXPANDEDW) {
+                auto* tree = reinterpret_cast<NMTREEVIEWW*>(lParam);
+                SyncTreeExpansion(
+                    header->hwndFrom,
+                    tree->itemNew.hItem,
+                    tree->action);
+                return 0;
+            }
+
+            if (header->code == TVN_SELCHANGEDW) {
+                auto* tree = reinterpret_cast<NMTREEVIEWW*>(lParam);
+                SyncTreeSelection(header->hwndFrom, tree->itemNew.hItem);
+                return 0;
+            }
+
+            if (header->hwndFrom == gTargetTree &&
+                header->code == NM_CUSTOMDRAW) {
+                return HandleTargetTreeCustomDraw(
+                    reinterpret_cast<NMTVCUSTOMDRAW*>(lParam));
+            }
         }
         break;
     }
@@ -843,7 +1236,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     INITCOMMONCONTROLSEX controls{};
     controls.dwSize = sizeof(controls);
-    controls.dwICC = ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES;
+    controls.dwICC = ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES;
     InitCommonControlsEx(&controls);
 
     HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
