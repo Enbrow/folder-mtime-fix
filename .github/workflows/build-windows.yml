@@ -55,9 +55,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $notesFile = "release-notes/${{ github.ref_name }}.md"
+          if (-not (Test-Path $notesFile)) {
+            Write-Output "::error::Missing curated release notes: $notesFile"
+            exit 1
+          }
+
           gh release create "${{ github.ref_name }}" `
             "build/Release/FolderMTimeFix.exe#FolderMTimeFix.exe" `
             --repo "${{ github.repository }}" `
             --title "FolderMTimeFix ${{ github.ref_name }}" `
-            --generate-notes `
+            --notes-file "$notesFile" `
             --verify-tag
