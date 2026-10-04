@@ -236,15 +236,19 @@ public:
     Processor(
         std::wstring root,
         Mode mode,
-        std::vector<std::wstring> excludedDirectories)
+        std::vector<std::wstring> excludedDirectories,
+        bool ignoreDirectSubdirectoryTimes)
         : root_(std::move(root)),
           mode_(mode),
-          excludedDirectories_(std::move(excludedDirectories)) {
+          excludedDirectories_(std::move(excludedDirectories)),
+          ignoreDirectSubdirectoryTimes_(ignoreDirectSubdirectoryTimes) {
         for (auto& path : excludedDirectories_) {
             path = TrimTrailingSlashes(std::move(path));
         }
         result_.root = root_;
         result_.mode = mode_;
+        result_.ignoreDirectSubdirectoryTimes =
+            ignoreDirectSubdirectoryTimes_;
     }
 
     Result Run() {
@@ -366,7 +370,8 @@ private:
             target = newest->discoveredTime;
             sourceType = L"file";
             sourcePath = newest->path;
-        } else if (!childOutcomes.empty()) {
+        } else if (!ignoreDirectSubdirectoryTimes_ &&
+                   !childOutcomes.empty()) {
             const ChildOutcome* newest = nullptr;
             for (const auto& child : childOutcomes) {
                 if (!child.valid) {
@@ -493,6 +498,7 @@ private:
     std::wstring root_;
     Mode mode_;
     std::vector<std::wstring> excludedDirectories_;
+    bool ignoreDirectSubdirectoryTimes_ = true;
     Result result_;
 };
 
@@ -509,11 +515,13 @@ std::wstring NormalizeForCompare(std::wstring path) {
 Result ProcessTree(
     const std::wstring& root,
     Mode mode,
-    const std::vector<std::wstring>& excludedDirectories) {
+    const std::vector<std::wstring>& excludedDirectories,
+    bool ignoreDirectSubdirectoryTimes) {
     Processor processor(
         TrimTrailingSlashes(root),
         mode,
-        excludedDirectories);
+        excludedDirectories,
+        ignoreDirectSubdirectoryTimes);
     return processor.Run();
 }
 
@@ -553,6 +561,9 @@ std::wstring FormatLog(const Result& result) {
     std::wstringstream out;
     out << L"# FolderMTimeFix\r\n";
     out << L"# mode=" << (result.mode == Mode::DryRun ? L"dry-run" : L"apply") << L"\r\n";
+    out << L"# ignore_direct_subdirectory_times="
+        << (result.ignoreDirectSubdirectoryTimes ? L"true" : L"false")
+        << L"\r\n";
     out << L"# root=\"" << result.root << L"\"\r\n\r\n";
 
     for (const auto& entry : result.entries) {

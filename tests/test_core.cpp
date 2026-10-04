@@ -191,7 +191,8 @@ int wmain() {
 
     // Scenario 2:
     // C and D have no direct files; D contains deep.txt.
-    // The time is allowed to propagate through a chain of fileless directories.
+    // Default behavior ignores direct child-directory times, so D follows its
+    // direct file but C does not inherit D's processed time.
     const std::wstring C = Join(temp.path, L"C");
     const std::wstring D = Join(C, L"D");
     const std::wstring deep = Join(D, L"deep.txt");
@@ -204,14 +205,46 @@ int wmain() {
     const auto preview2 = fmtfix::ProcessTree(C, fmtfix::Mode::DryRun);
     const auto* eC = FindEntry(preview2, C);
     const auto* eD = FindEntry(preview2, D);
-    ok &= Expect(eD && eD->hasTarget && EqualTime(eD->target, t2025), "D preview target must be deep file time");
-    ok &= Expect(eC && eC->hasTarget && EqualTime(eC->target, t2025), "C preview must simulate D post-processing time");
+    ok &= Expect(
+        preview2.ignoreDirectSubdirectoryTimes,
+        "Direct child-directory times must be ignored by default");
+    ok &= Expect(
+        eD && eD->hasTarget && EqualTime(eD->target, t2025),
+        "D preview target must be deep file time");
+    ok &= Expect(
+        eC && !eC->hasTarget &&
+            eC->status == fmtfix::EntryStatus::SkippedEmpty,
+        "C preview must not inherit D when child-directory times are ignored");
 
     fmtfix::ProcessTree(C, fmtfix::Mode::Apply);
     FILETIME afterC{}, afterD{};
     GetPathTime(C, afterC); GetPathTime(D, afterD);
     ok &= Expect(EqualTime(afterD, t2025), "D apply result must be 2025");
-    ok &= Expect(EqualTime(afterC, t2025), "C apply result must be 2025");
+    ok &= Expect(
+        EqualTime(afterC, t2023),
+        "C must remain unchanged when child-directory times are ignored");
+
+    // The optional legacy mode restores recursive propagation through fileless
+    // directories.
+    SetPathTime(D, t2023, true);
+    SetPathTime(C, t2023, true);
+    const auto propagatedPreview =
+        fmtfix::ProcessTree(C, fmtfix::Mode::DryRun, {}, false);
+    const auto* propagatedC = FindEntry(propagatedPreview, C);
+    ok &= Expect(
+        !propagatedPreview.ignoreDirectSubdirectoryTimes,
+        "Propagation mode must be recorded in the result");
+    ok &= Expect(
+        propagatedC && propagatedC->hasTarget &&
+            EqualTime(propagatedC->target, t2025) &&
+            _wcsicmp(propagatedC->sourcePath.c_str(), D.c_str()) == 0,
+        "C preview must inherit D when child-directory times are enabled");
+
+    fmtfix::ProcessTree(C, fmtfix::Mode::Apply, {}, false);
+    GetPathTime(C, afterC); GetPathTime(D, afterD);
+    ok &= Expect(
+        EqualTime(afterD, t2025) && EqualTime(afterC, t2025),
+        "Propagation mode must update both D and C to 2025");
 
     // Scenario 3: an empty directory stays unchanged.
     const std::wstring Empty = Join(temp.path, L"Empty");
@@ -237,7 +270,8 @@ int wmain() {
     ok &= Expect(EqualTime(dotAfter, t2024), "Dot-prefixed file must be ignored");
 
     // Scenario 5: excluded directory and its subtree are not modified.
-    // Its current directory time may still act as the parent's reference time.
+    // With the default "ignore direct child directory times" rule, the parent
+    // also leaves its own timestamp alone when it has no direct files.
     const std::wstring E = Join(temp.path, L"E");
     const std::wstring F = Join(E, L"F");
     const std::wstring G = Join(F, L"G");
@@ -261,9 +295,8 @@ int wmain() {
             EqualTime(previewG, t2024),
         "Dry-run with exclusion must not modify parent or excluded subtree");
     ok &= Expect(
-        previewExcludedParent && previewExcludedParent->hasTarget &&
-            EqualTime(previewExcludedParent->target, t2023),
-        "Dry-run parent must preview the excluded child's current time");
+        previewExcludedParent && !previewExcludedParent->hasTarget,
+        "Default mode must ignore the excluded child's directory time");
     ok &= Expect(
         FindEntry(excludedPreview, F) == nullptr &&
             FindEntry(excludedPreview, G) == nullptr,
@@ -274,15 +307,32 @@ int wmain() {
     FILETIME afterE{}, afterF{}, afterG{};
     GetPathTime(E, afterE); GetPathTime(F, afterF); GetPathTime(G, afterG);
     ok &= Expect(
-        EqualTime(afterF, t2023) && EqualTime(afterG, t2024),
-        "Excluded directory subtree must keep its original times");
-    ok &= Expect(
-        EqualTime(afterE, t2023),
-        "Parent may use excluded child's current time as reference");
+        EqualTime(afterE, t2026) &&
+            EqualTime(afterF, t2023) && EqualTime(afterG, t2024),
+        "Default mode must preserve parent and excluded subtree times");
     ok &= Expect(
         FindEntry(excludedResult, F) == nullptr &&
             FindEntry(excludedResult, G) == nullptr,
         "Excluded directory subtree must not be logged as processed");
+
+    // When propagation is explicitly enabled, an excluded child's current
+    // directory timestamp may still act as its direct parent's reference.
+    const auto excludedPropagationPreview =
+        fmtfix::ProcessTree(E, fmtfix::Mode::DryRun, {F}, false);
+    const auto* propagatedExcludedParent =
+        FindEntry(excludedPropagationPreview, E);
+    ok &= Expect(
+        propagatedExcludedParent &&
+            propagatedExcludedParent->hasTarget &&
+            EqualTime(propagatedExcludedParent->target, t2023),
+        "Propagation mode must allow the excluded child's current time");
+
+    fmtfix::ProcessTree(E, fmtfix::Mode::Apply, {F}, false);
+    GetPathTime(E, afterE); GetPathTime(F, afterF); GetPathTime(G, afterG);
+    ok &= Expect(
+        EqualTime(afterE, t2023) &&
+            EqualTime(afterF, t2023) && EqualTime(afterG, t2024),
+        "Propagation mode may update the parent but not the excluded subtree");
 
     if (!ok) {
         return 1;

@@ -44,6 +44,7 @@ struct Summary {
 struct Result {
     std::wstring root;
     Mode mode = Mode::DryRun;
+    bool ignoreDirectSubdirectoryTimes = true;
     std::vector<LogEntry> entries;
     Summary summary;
 };
@@ -52,9 +53,11 @@ struct Result {
 //   - Process child directories before parents.
 //   - If a directory has one or more direct, non-dot, non-reparse files,
 //     use the newest of those files and ignore child-directory times.
-//   - Otherwise, if it has direct child directories, use the newest child's
-//     effective post-processing time. This can propagate through a chain of
-//     fileless directories, but stops at any directory that has direct files.
+//   - If ignoreDirectSubdirectoryTimes is true (default), a directory with no
+//     direct files is left unchanged even if it has child directories.
+//   - If ignoreDirectSubdirectoryTimes is false, a fileless directory uses the
+//     newest direct child's effective post-processing time. This can propagate
+//     through a chain of fileless directories.
 //   - Empty directories are unchanged.
 //   - Dot-prefixed entries (e.g. .git) and reparse points are ignored.
 //   - Excluded directories are not processed recursively; their current
@@ -62,7 +65,8 @@ struct Result {
 Result ProcessTree(
     const std::wstring& root,
     Mode mode,
-    const std::vector<std::wstring>& excludedDirectories = {});
+    const std::vector<std::wstring>& excludedDirectories = {},
+    bool ignoreDirectSubdirectoryTimes = true);
 
 std::wstring FormatFileTimeLocal(const FILETIME& ft);
 std::wstring FormatLog(const Result& result);

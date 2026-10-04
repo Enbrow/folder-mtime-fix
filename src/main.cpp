@@ -48,6 +48,7 @@ constexpr int IDC_LOG_LABEL = 1014;
 constexpr int IDC_RIGHT_TOGGLE = 1015;
 constexpr int IDC_SUMMARY = 1016;
 constexpr int IDC_LOG_TOGGLE = 1017;
+constexpr int IDC_IGNORE_CHILD_TIMES = 1018;
 
 constexpr UINT IDM_EXPAND_ALL = 2001;
 constexpr UINT IDM_COLLAPSE_ALL = 2002;
@@ -72,6 +73,7 @@ HWND gChangeList = nullptr;
 HWND gRightToggle = nullptr;
 HWND gLogLabel = nullptr;
 HWND gLogToggle = nullptr;
+HWND gIgnoreChildTimes = nullptr;
 HFONT gFont = nullptr;
 HFONT gMonoFont = nullptr;
 HIMAGELIST gSystemImageList = nullptr;
@@ -132,6 +134,33 @@ void SetControlsEnabled(bool enabled) {
     EnableWindow(gApply, enabled);
     EnableWindow(gCopy, enabled && !gLastLog.empty());
     EnableWindow(gSave, enabled && !gLastLog.empty());
+    EnableWindow(gIgnoreChildTimes, enabled);
+}
+
+bool IgnoreDirectSubdirectoryTimesEnabled() {
+    return gIgnoreChildTimes == nullptr ||
+           SendMessageW(gIgnoreChildTimes, BM_GETCHECK, 0, 0) ==
+               BST_CHECKED;
+}
+
+void UpdateRuleText() {
+    if (gRule == nullptr) {
+        return;
+    }
+
+    if (IgnoreDirectSubdirectoryTimesEnabled()) {
+        SetWindowTextW(
+            gRule,
+            L"时间规则\r\n"
+            L"有直属文件 → 取最新直属文件；无直属文件 → 不参考直属子目录。"
+            L"  不逐级上传递；空目录不修改；忽略 .git 与 Junction / 符号链接。");
+    } else {
+        SetWindowTextW(
+            gRule,
+            L"时间规则\r\n"
+            L"有直属文件 → 取最新直属文件；无直属文件 → 取最新直属子目录。"
+            L"  可逐级上传递；空目录不修改；忽略 .git 与 Junction / 符号链接。");
+    }
 }
 
 int ScaleForDpi(HWND hwnd, int value) {
@@ -1548,12 +1577,24 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
         return;
     }
 
+    const bool ignoreDirectSubdirectoryTimes =
+        IgnoreDirectSubdirectoryTimesEnabled();
+
     if (mode == fmtfix::Mode::Apply) {
         std::wstring message =
             L"即将实际修改以下目录树中的文件夹“修改时间”：\n\n" + root +
             L"\n\n规则：\n"
-            L"• 有直属文件：使用最新直属文件时间，忽略子目录时间。\n"
-            L"• 没有直属文件：使用最新直属子目录的处理后时间。\n"
+            L"• 有直属文件：使用最新直属文件时间，忽略子目录时间。\n";
+        if (ignoreDirectSubdirectoryTimes) {
+            message +=
+                L"• 没有直属文件：忽略直属子目录时间，不修改该目录。\n"
+                L"• 不会通过文件夹时间逐级向上传递。\n";
+        } else {
+            message +=
+                L"• 没有直属文件：使用最新直属子目录的处理后时间。\n"
+                L"• 文件夹时间可以逐级向上传递。\n";
+        }
+        message +=
             L"• 空目录不修改。\n"
             L"• 忽略 .git 等以点开头的项目和所有 Reparse Point。\n\n"
             L"建议先执行 Dry Run。确定继续吗？";
@@ -1582,7 +1623,11 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
     gExpandedPaths.insert(root);
 
     const fmtfix::Result result =
-        fmtfix::ProcessTree(root, mode, CurrentExclusions());
+        fmtfix::ProcessTree(
+            root,
+            mode,
+            CurrentExclusions(),
+            ignoreDirectSubdirectoryTimes);
 
     gLastRoot = root;
     gLastLog = fmtfix::FormatLog(result);
@@ -1607,7 +1652,7 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
             << L"：目录 " << result.summary.directories
             << L"，" << (mode == fmtfix::Mode::DryRun ? L"预计修改 " : L"已修改 ") << result.summary.changedOrWouldChange
             << L"，未变化 " << result.summary.unchanged
-            << L"，空目录 " << result.summary.skipped
+            << L"，跳过 " << result.summary.skipped
             << L"，错误 " << result.summary.errors << L"。";
 
     const std::wstring logStatus = AutoSaveTempLog(root);
@@ -1641,8 +1686,8 @@ void RefreshFonts(HWND hwnd) {
 
     for (HWND child : {
              gRule, gSummary, gPath, gBrowse, gDryRun, gApply, gCopy, gSave,
-             gStatus, gCurrentLabel, gTreeGrid, gTargetLabel, gChangeList,
-             gRightToggle, gLogLabel, gLogToggle}) {
+             gIgnoreChildTimes, gStatus, gCurrentLabel, gTreeGrid,
+             gTargetLabel, gChangeList, gRightToggle, gLogLabel, gLogToggle}) {
         ApplyFont(child, gFont);
     }
     ApplyFont(gLog, gMonoFont != nullptr ? gMonoFont : gFont);
@@ -1717,6 +1762,14 @@ void LayoutControls(HWND hwnd) {
     MoveWindow(gCopy, x, y, copyW, rowH, TRUE);
     x += copyW + gap;
     MoveWindow(gSave, x, y, saveW, rowH, TRUE);
+    x += saveW + gap;
+    MoveWindow(
+        gIgnoreChildTimes,
+        x,
+        y,
+        ScaleForDpi(hwnd, 220),
+        rowH,
+        TRUE);
     y += rowH + gap;
 
     MoveWindow(
@@ -1832,10 +1885,10 @@ void LayoutControls(HWND hwnd) {
         TRUE);
 
     if (gLogCollapsed) {
-        SetWindowTextW(gLogToggle, L"展开日志 ↓");
+        SetWindowTextW(gLogToggle, L"展开日志 ↑");
         ShowWindow(gLog, SW_HIDE);
     } else {
-        SetWindowTextW(gLogToggle, L"收起日志 ↑");
+        SetWindowTextW(gLogToggle, L"收起日志 ↓");
         ShowWindow(gLog, SW_SHOW);
         y += labelH;
         MoveWindow(
@@ -1904,6 +1957,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_PUSHBUTTON,
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(IDC_SAVE), nullptr, nullptr);
+
+        gIgnoreChildTimes = CreateWindowExW(
+            0, L"BUTTON", L"忽略直属子目录时间",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_IGNORE_CHILD_TIMES), nullptr, nullptr);
+        SendMessageW(
+            gIgnoreChildTimes,
+            BM_SETCHECK,
+            BST_CHECKED,
+            0);
 
         gStatus = CreateWindowExW(
             0, L"STATIC", L"先选择文件夹，再执行 Dry Run。",
@@ -1979,7 +2043,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             reinterpret_cast<HMENU>(IDC_LOG_LABEL), nullptr, nullptr);
 
         gLogToggle = CreateWindowExW(
-            0, L"BUTTON", L"收起日志 ↑",
+            0, L"BUTTON", L"收起日志 ↓",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(IDC_LOG_TOGGLE), nullptr, nullptr);
@@ -1997,6 +2061,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             50u * 1024u * 1024u,
             0);
 
+        UpdateRuleText();
         RefreshFonts(hwnd);
 
         // Start with the current working directory as a convenience.
@@ -2077,6 +2142,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_LOG_TOGGLE:
             gLogCollapsed = !gLogCollapsed;
             LayoutControls(hwnd);
+            return 0;
+        case IDC_IGNORE_CHILD_TIMES:
+            UpdateRuleText();
+            SetStatus(L"时间规则已更改，请重新执行 Dry Run 预览。");
             return 0;
         default:
             break;
