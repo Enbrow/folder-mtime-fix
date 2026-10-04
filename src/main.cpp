@@ -1819,11 +1819,14 @@ void LayoutControls(HWND hwnd) {
         rightW = std::max(1, contentW - leftW - splitGap);
     }
 
+    const int currentLabelW = gRightCollapsed
+        ? std::max(1, leftW - toggleW - gap)
+        : leftW;
     MoveWindow(
         gCurrentLabel,
         margin,
         y,
-        std::max(1, leftW - toggleW - gap),
+        currentLabelW,
         labelH,
         TRUE);
 
@@ -1978,7 +1981,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         gCurrentLabel = CreateWindowExW(
             0, L"STATIC", L"目录树    （黄色行 = 将修改；蓝色行 = 参考来源；灰色行 = 已排除）",
-            WS_CHILD | WS_VISIBLE,
+            WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(IDC_CURRENT_LABEL), nullptr, nullptr);
 
