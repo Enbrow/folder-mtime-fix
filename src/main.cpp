@@ -1000,9 +1000,10 @@ int TreeDepth(const FsNode* node) {
 }
 
 int TreeIndentPixels() {
-    // WizTree-style compact indentation. At 100% DPI this places the next
-    // level's guide about 3 px left of the parent folder icon center.
-    return ScaleForDpi(gTreeGrid, 16);
+    // Match WizTree's compact tree proportions: the next level's guide sits
+    // slightly left of the parent folder icon center without crowding the
+    // expand box and icon together.
+    return ScaleForDpi(gTreeGrid, 15);
 }
 
 int TreeBoxSizePixels() {
