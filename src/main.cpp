@@ -986,10 +986,43 @@ bool HasNextSibling(const FsNode* node) {
     return false;
 }
 
-std::wstring BranchPrefix(const FsNode* node) {
-    if (node == nullptr || node->parent == nullptr) {
-        return {};
+int TreeDepth(const FsNode* node) {
+    int depth = 0;
+    for (const FsNode* p = node;
+         p != nullptr && p->parent != nullptr;
+         p = p->parent) {
+        ++depth;
     }
+    return depth;
+}
+
+int TreeIndentPixels() {
+    return ScaleForDpi(gTreeGrid, 18);
+}
+
+int TreeNodeBoxX(const FsNode* node, const RECT& rect) {
+    return rect.left +
+           ScaleForDpi(gTreeGrid, 5) +
+           TreeDepth(node) * TreeIndentPixels();
+}
+
+void DrawTreeBranches(
+    HDC dc,
+    const FsNode* node,
+    const RECT& rect,
+    COLORREF color) {
+    if (node == nullptr || node->parent == nullptr) {
+        return;
+    }
+
+    const int depth = TreeDepth(node);
+    if (depth <= 0) {
+        return;
+    }
+
+    const int indent = TreeIndentPixels();
+    const int baseX = rect.left + ScaleForDpi(gTreeGrid, 5);
+    const int midY = (rect.top + rect.bottom) / 2;
 
     std::vector<const FsNode*> ancestors;
     for (const FsNode* p = node->parent;
@@ -999,29 +1032,38 @@ std::wstring BranchPrefix(const FsNode* node) {
     }
     std::reverse(ancestors.begin(), ancestors.end());
 
-    std::wstring prefix;
-    for (const FsNode* ancestor : ancestors) {
-        prefix += HasNextSibling(ancestor) ? L"│   " : L"    ";
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    if (pen == nullptr) {
+        return;
     }
-    prefix += HasNextSibling(node) ? L"├─ " : L"└─ ";
-    return prefix;
-}
+    HGDIOBJ oldPen = SelectObject(dc, pen);
 
-SIZE TextExtent(HDC dc, HFONT font, const std::wstring& text) {
-    SIZE size{};
-    HGDIOBJ old = nullptr;
-    if (font != nullptr) {
-        old = SelectObject(dc, font);
+    // Continuation lines for ancestor levels.
+    for (size_t i = 0; i < ancestors.size(); ++i) {
+        if (!HasNextSibling(ancestors[i])) {
+            continue;
+        }
+        const int x =
+            baseX + static_cast<int>(i) * indent + indent / 2;
+        MoveToEx(dc, x, rect.top, nullptr);
+        LineTo(dc, x, rect.bottom);
     }
-    GetTextExtentPoint32W(
+
+    // Branch for this row. Both the vertical and horizontal strokes share the
+    // exact same X/Y pixel, so deeper levels cannot drift like text glyphs do.
+    const int branchX =
+        baseX + (depth - 1) * indent + indent / 2;
+    MoveToEx(dc, branchX, rect.top, nullptr);
+    LineTo(
         dc,
-        text.c_str(),
-        static_cast<int>(text.size()),
-        &size);
-    if (old != nullptr) {
-        SelectObject(dc, old);
-    }
-    return size;
+        branchX,
+        HasNextSibling(node) ? rect.bottom : midY + 1);
+
+    MoveToEx(dc, branchX, midY, nullptr);
+    LineTo(dc, TreeNodeBoxX(node, rect), midY);
+
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
 }
 
 COLORREF NodeBackground(const FsNode* node, bool selected) {
@@ -1139,25 +1181,16 @@ LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
             draw->nmcd.hdc,
             NodeTextColor(node, selected));
 
-        int x = rect.left + ScaleForDpi(gTreeGrid, 5);
-        const std::wstring prefix = BranchPrefix(node);
-        if (!prefix.empty()) {
-            const SIZE prefixSize =
-                TextExtent(draw->nmcd.hdc, gMonoFont, prefix);
-            HGDIOBJ oldFont = SelectObject(
-                draw->nmcd.hdc,
-                gMonoFont != nullptr ? gMonoFont : gFont);
-            TextOutW(
-                draw->nmcd.hdc,
-                x,
-                rect.top + (rect.bottom - rect.top - prefixSize.cy) / 2,
-                prefix.c_str(),
-                static_cast<int>(prefix.size()));
-            SelectObject(draw->nmcd.hdc, oldFont);
-            x += prefixSize.cx;
-        }
-
         const int boxSize = ScaleForDpi(gTreeGrid, 11);
+        DrawTreeBranches(
+            draw->nmcd.hdc,
+            node,
+            rect,
+            selected
+                ? GetSysColor(COLOR_HIGHLIGHTTEXT)
+                : GetSysColor(COLOR_GRAYTEXT));
+
+        int x = TreeNodeBoxX(node, rect);
         const int boxY =
             rect.top + (rect.bottom - rect.top - boxSize) / 2;
         if (node->isDirectory && !node->children.empty()) {
@@ -1255,14 +1288,7 @@ int TreeToggleXForRow(int row) {
         return -1;
     }
 
-    HDC dc = GetDC(gTreeGrid);
-    const std::wstring prefix = BranchPrefix(node);
-    const SIZE prefixSize = TextExtent(dc, gMonoFont, prefix);
-    ReleaseDC(gTreeGrid, dc);
-
-    return rect.left +
-           ScaleForDpi(gTreeGrid, 5) +
-           prefixSize.cx;
+    return TreeNodeBoxX(node, rect);
 }
 
 void ToggleTreeNode(int row) {
