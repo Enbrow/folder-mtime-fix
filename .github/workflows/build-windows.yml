@@ -17,6 +17,56 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Reconstruct and apply Tree-Grid WIP patch
+        shell: pwsh
+        run: |
+          $parts = @(
+            ".ci-wip/patch.b64.00",
+            ".ci-wip/patch.b64.01",
+            ".ci-wip/patch.b64.02"
+          )
+          $b64 = ""
+          foreach ($part in $parts) {
+            $b64 += (Get-Content $part -Raw).Trim()
+          }
+
+          $gzipPath = Join-Path $PWD "treegrid-wip.patch.gz"
+          $patchPath = Join-Path $PWD "treegrid-wip.patch"
+          [System.IO.File]::WriteAllBytes(
+            $gzipPath,
+            [System.Convert]::FromBase64String($b64)
+          )
+
+          $input = [System.IO.File]::OpenRead($gzipPath)
+          try {
+            $output = [System.IO.File]::Create($patchPath)
+            try {
+              $gzip = [System.IO.Compression.GZipStream]::new(
+                $input,
+                [System.IO.Compression.CompressionMode]::Decompress
+              )
+              try {
+                $gzip.CopyTo($output)
+              }
+              finally {
+                $gzip.Dispose()
+              }
+            }
+            finally {
+              $output.Dispose()
+            }
+          }
+          finally {
+            $input.Dispose()
+          }
+
+          git apply --check $patchPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply $patchPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Configure x64 Release
         run: cmake -S . -B build -A x64
 
