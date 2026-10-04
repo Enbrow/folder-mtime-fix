@@ -1000,11 +1000,53 @@ int TreeDepth(const FsNode* node) {
 }
 
 int TreeIndentPixels() {
-    return ScaleForDpi(gTreeGrid, 18);
+    // WizTree-style compact indentation. At 100% DPI this places the next
+    // level's guide about 3 px left of the parent folder icon center.
+    return ScaleForDpi(gTreeGrid, 16);
 }
 
 int TreeBoxSizePixels() {
     return ScaleForDpi(gTreeGrid, 11);
+}
+
+void DrawDenseDottedVLine(
+    HDC dc,
+    int x,
+    int top,
+    int bottom,
+    COLORREF color) {
+    if (bottom < top) {
+        std::swap(top, bottom);
+    }
+
+    // One device pixel on, one device pixel off. Using the absolute control
+    // coordinate parity keeps vertical guides continuous across adjacent rows.
+    int y = top;
+    if ((y & 1) != 0) {
+        ++y;
+    }
+    for (; y <= bottom; y += 2) {
+        SetPixelV(dc, x, y, color);
+    }
+}
+
+void DrawDenseDottedHLine(
+    HDC dc,
+    int left,
+    int right,
+    int y,
+    COLORREF color) {
+    if (right < left) {
+        std::swap(left, right);
+    }
+
+    int x = left;
+    if ((x & 1) != 0) {
+        ++x;
+    }
+    for (; x <= right; x += 2) {
+        SetPixelV(dc, x, y, color);
+    }
 }
 
 int TreeNodeBoxX(const FsNode* node, const RECT& rect) {
@@ -1047,14 +1089,6 @@ void DrawTreeBranches(
     }
     std::reverse(ancestors.begin(), ancestors.end());
 
-    // WizTree/TreeView-like dotted guide lines.
-    HPEN pen = CreatePen(PS_DOT, 1, color);
-    if (pen == nullptr) {
-        return;
-    }
-    HGDIOBJ oldPen = SelectObject(dc, pen);
-    const int oldBkMode = SetBkMode(dc, TRANSPARENT);
-
     // Continuation lines for ancestor levels. ancestors[0] is level 1.
     for (size_t i = 0; i < ancestors.size(); ++i) {
         if (!HasNextSibling(ancestors[i])) {
@@ -1064,29 +1098,34 @@ void DrawTreeBranches(
             baseX +
             (static_cast<int>(i) + 1) * indent +
             indent / 2;
-        MoveToEx(dc, x, rect.top, nullptr);
-        LineTo(dc, x, rect.bottom);
+        DrawDenseDottedVLine(
+            dc,
+            x,
+            rect.top,
+            rect.bottom,
+            color);
     }
 
     // Current branch axis goes through the exact center of the node box.
     const int branchX =
         baseX + depth * indent + indent / 2;
-    MoveToEx(dc, branchX, rect.top, nullptr);
-    LineTo(
+    DrawDenseDottedVLine(
         dc,
         branchX,
-        HasNextSibling(node) ? rect.bottom : midY + 1);
+        rect.top,
+        HasNextSibling(node) ? rect.bottom : midY,
+        color);
 
-    // Draw a short dotted arm toward the icon. The expand box is painted after
-    // this and covers the middle portion, leaving the guide visually attached
-    // to the box center without drawing through the box interior.
+    // Draw a short dense dotted arm toward the icon. The expand box is painted
+    // after this and covers its interior, so the guide appears to meet the box
+    // at the exact center while retaining the classic WizTree look.
     const int boxRight = TreeNodeBoxX(node, rect) + boxSize;
-    MoveToEx(dc, branchX, midY, nullptr);
-    LineTo(dc, boxRight + ScaleForDpi(gTreeGrid, 4), midY);
-
-    SetBkMode(dc, oldBkMode);
-    SelectObject(dc, oldPen);
-    DeleteObject(pen);
+    DrawDenseDottedHLine(
+        dc,
+        branchX,
+        boxRight + ScaleForDpi(gTreeGrid, 4),
+        midY,
+        color);
 }
 
 COLORREF NodeBackground(const FsNode* node, bool selected) {
