@@ -1000,10 +1000,10 @@ int TreeDepth(const FsNode* node) {
 }
 
 int TreeIndentPixels() {
-    // Match WizTree's compact tree proportions: the next level's guide sits
-    // slightly left of the parent folder icon center without crowding the
-    // expand box and icon together.
-    return ScaleForDpi(gTreeGrid, 15);
+    // Match WizTree's compact tree proportions: keep the next level's guide
+    // clearly left of the parent folder icon center while preserving enough
+    // room for the expand box and icon.
+    return ScaleForDpi(gTreeGrid, 14);
 }
 
 int TreeBoxSizePixels() {
