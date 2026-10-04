@@ -1066,18 +1066,10 @@ bool GetTreeCellRect(int row, RECT& rect) {
         return false;
     }
 
-    // Header_GetItemRect returns coordinates in the header's own client area.
-    // During horizontal scrolling the header window itself is shifted relative
-    // to the list view, so map the rectangle back to list-view coordinates.
-    // Without this conversion the custom-drawn tree cell is repainted at its
-    // unscrolled X position while Windows scrolls the existing pixels, leaving
-    // repeated tree lines/icons behind.
-    MapWindowPoints(
-        header,
-        gTreeGrid,
-        reinterpret_cast<POINT*>(&columnRect),
-        2);
-
+    // Header_GetItemRect already reports the column position used by the
+    // report-view header, including its horizontal-scroll state. Do not map it
+    // through the header window again: doing so applies the scroll offset twice
+    // and clips the right side of column 0 after scrolling back.
     rect.left = columnRect.left;
     rect.right = columnRect.right;
     rect.top = rowRect.top;
@@ -1215,6 +1207,40 @@ LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
     }
 
     return CDRF_DODEFAULT;
+}
+
+LRESULT CALLBACK TreeGridSubclassProc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR subclassId,
+    DWORD_PTR) {
+    if (msg == WM_HSCROLL || msg == WM_MOUSEHWHEEL) {
+        const LRESULT result =
+            DefSubclassProc(hwnd, msg, wParam, lParam);
+
+        // Report-view ListView optimizes scrolling by moving existing pixels
+        // and invalidating only the newly exposed strip. That is fine for its
+        // native cells, but column 0 is custom-drawn, so a partial repaint can
+        // leave shifted or missing tree glyphs after the scrollbar comes back.
+        // Repaint the whole control at the new scroll position.
+        RedrawWindow(
+            hwnd,
+            nullptr,
+            nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+        return result;
+    }
+
+    if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(
+            hwnd,
+            TreeGridSubclassProc,
+            subclassId);
+    }
+
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
 int TreeToggleXForRow(int row) {
@@ -1765,6 +1791,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             listStyle,
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(IDC_TREEGRID), nullptr, nullptr);
+        if (gTreeGrid != nullptr) {
+            SetWindowSubclass(
+                gTreeGrid,
+                TreeGridSubclassProc,
+                1,
+                0);
+        }
 
         gChangeList = CreateWindowExW(
             WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
