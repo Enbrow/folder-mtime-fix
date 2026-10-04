@@ -1066,8 +1066,18 @@ bool GetTreeCellRect(int row, RECT& rect) {
         return false;
     }
 
-    // Header_GetItemRect follows the current header order/position, so the
-    // custom tree cell keeps working even after the user drags column 0.
+    // Header_GetItemRect returns coordinates in the header's own client area.
+    // During horizontal scrolling the header window itself is shifted relative
+    // to the list view, so map the rectangle back to list-view coordinates.
+    // Without this conversion the custom-drawn tree cell is repainted at its
+    // unscrolled X position while Windows scrolls the existing pixels, leaving
+    // repeated tree lines/icons behind.
+    MapWindowPoints(
+        header,
+        gTreeGrid,
+        reinterpret_cast<POINT*>(&columnRect),
+        2);
+
     rect.left = columnRect.left;
     rect.right = columnRect.right;
     rect.top = rowRect.top;
@@ -1111,6 +1121,18 @@ LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
         if (!GetTreeCellRect(row, rect)) {
             return CDRF_DODEFAULT;
         }
+
+        // Restrict every custom-drawn primitive to the current tree cell.
+        // This is especially important while the list view is horizontally
+        // scrolling, because parts of column 0 can temporarily sit outside the
+        // visible client area.
+        const int savedDc = SaveDC(draw->nmcd.hdc);
+        IntersectClipRect(
+            draw->nmcd.hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom);
 
         const bool selected =
             (ListView_GetItemState(gTreeGrid, row, LVIS_SELECTED) &
@@ -1185,6 +1207,10 @@ LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
             &textRect,
             DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS |
                 DT_NOPREFIX);
+
+        if (savedDc != 0) {
+            RestoreDC(draw->nmcd.hdc, savedDc);
+        }
         return CDRF_SKIPDEFAULT;
     }
 
