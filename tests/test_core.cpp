@@ -236,6 +236,30 @@ int wmain() {
     GetPathTime(Dot, dotAfter);
     ok &= Expect(EqualTime(dotAfter, t2024), "Dot-prefixed file must be ignored");
 
+    // Scenario 5: excluded directory and its subtree are not modified.
+    // Its current directory time may still act as the parent's reference time.
+    const std::wstring E = Join(temp.path, L"E");
+    const std::wstring F = Join(E, L"F");
+    const std::wstring excludedFile = Join(F, L"excluded.txt");
+    MakeDir(E); MakeDir(F); MakeFile(excludedFile);
+    SetPathTime(excludedFile, t2025, false);
+    SetPathTime(F, t2023, true);
+    SetPathTime(E, t2026, true);
+
+    const auto excludedResult =
+        fmtfix::ProcessTree(E, fmtfix::Mode::Apply, {F});
+    FILETIME afterE{}, afterF{};
+    GetPathTime(E, afterE); GetPathTime(F, afterF);
+    ok &= Expect(
+        EqualTime(afterF, t2023),
+        "Excluded directory must keep its original time");
+    ok &= Expect(
+        EqualTime(afterE, t2023),
+        "Parent may use excluded child's current time as reference");
+    ok &= Expect(
+        FindEntry(excludedResult, F) == nullptr,
+        "Excluded directory must not be logged as processed");
+
     if (!ok) {
         return 1;
     }

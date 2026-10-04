@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cwctype>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -39,13 +41,18 @@ constexpr int IDC_LOG = 1007;
 constexpr int IDC_STATUS = 1008;
 constexpr int IDC_RULE = 1009;
 constexpr int IDC_CURRENT_LABEL = 1010;
-constexpr int IDC_CURRENT_TREE = 1011;
+constexpr int IDC_TREEGRID = 1011;
 constexpr int IDC_TARGET_LABEL = 1012;
 constexpr int IDC_CHANGE_LIST = 1013;
 constexpr int IDC_LOG_LABEL = 1014;
-constexpr int IDC_TARGET_TREE = 1015;
-constexpr int IDC_MODE_CHANGES = 1016;
-constexpr int IDC_MODE_TREE = 1017;
+constexpr int IDC_RIGHT_TOGGLE = 1015;
+constexpr int IDC_SUMMARY = 1016;
+
+constexpr UINT IDM_EXPAND_ALL = 2001;
+constexpr UINT IDM_COLLAPSE_ALL = 2002;
+constexpr UINT IDM_EXCLUDE = 2003;
+constexpr UINT IDM_INCLUDE = 2004;
+constexpr UINT IDM_REFRESH = 2005;
 
 HWND gPath = nullptr;
 HWND gBrowse = nullptr;
@@ -56,25 +63,47 @@ HWND gSave = nullptr;
 HWND gLog = nullptr;
 HWND gStatus = nullptr;
 HWND gRule = nullptr;
+HWND gSummary = nullptr;
 HWND gCurrentLabel = nullptr;
-HWND gCurrentTree = nullptr;
+HWND gTreeGrid = nullptr;
 HWND gTargetLabel = nullptr;
 HWND gChangeList = nullptr;
-HWND gTargetTree = nullptr;
-HWND gModeChanges = nullptr;
-HWND gModeTree = nullptr;
+HWND gRightToggle = nullptr;
 HWND gLogLabel = nullptr;
 HFONT gFont = nullptr;
 HFONT gMonoFont = nullptr;
+HIMAGELIST gSystemImageList = nullptr;
 std::wstring gLastLog;
 std::wstring gLastRoot;
-bool gTreePreviewMode = false;
-bool gSyncingTrees = false;
-std::map<std::wstring, HTREEITEM> gLeftTreeItems;
-std::map<std::wstring, HTREEITEM> gRightTreeItems;
-std::map<HTREEITEM, std::wstring> gLeftItemPaths;
-std::map<HTREEITEM, std::wstring> gRightItemPaths;
-std::set<HTREEITEM> gRightChangedItems;
+bool gRightCollapsed = false;
+int gSortColumn = 0;
+bool gSortAscending = true;
+std::set<std::wstring> gExpandedPaths;
+std::set<std::wstring> gExcludedPaths;
+
+struct FsNode {
+    std::wstring path;
+    std::wstring name;
+    std::wstring type;
+    std::wstring scanError;
+    FILETIME lastWrite{};
+    FILETIME targetTime{};
+    bool hasTarget = false;
+    bool isDirectory = false;
+    bool willChange = false;
+    bool isReference = false;
+    bool excluded = false;
+    bool expanded = false;
+    ULONGLONG size = 0;
+    size_t directFiles = 0;
+    size_t directDirectories = 0;
+    int iconIndex = -1;
+    FsNode* parent = nullptr;
+    std::vector<std::unique_ptr<FsNode>> children;
+};
+
+std::unique_ptr<FsNode> gRootNode;
+std::vector<FsNode*> gVisibleNodes;
 
 std::wstring GetWindowTextString(HWND hwnd) {
     const int len = GetWindowTextLengthW(hwnd);
@@ -382,7 +411,8 @@ void AddListColumn(HWND list, int index, const wchar_t* title) {
 void AddListRow(HWND list,
                 const std::wstring& first,
                 const std::wstring& second,
-                const std::wstring& third) {
+                const std::wstring& third,
+                const std::wstring& fourth = L"") {
     LVITEMW item{};
     item.mask = LVIF_TEXT;
     item.iItem = ListView_GetItemCount(list);
@@ -392,387 +422,861 @@ void AddListRow(HWND list,
     if (row >= 0) {
         ListView_SetItemText(list, row, 1, const_cast<LPWSTR>(second.c_str()));
         ListView_SetItemText(list, row, 2, const_cast<LPWSTR>(third.c_str()));
+        if (ListView_GetHeader(list) != nullptr &&
+            Header_GetItemCount(ListView_GetHeader(list)) > 3) {
+            ListView_SetItemText(list, row, 3, const_cast<LPWSTR>(fourth.c_str()));
+        }
     }
 }
 
-std::wstring ParentPath(const std::wstring& path) {
-    const size_t slash = path.find_last_of(L"\\/");
-    if (slash == std::wstring::npos) {
+ULONGLONG FileTimeValue(const FILETIME& ft) {
+    ULARGE_INTEGER value{};
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return value.QuadPart;
+}
+
+std::wstring FormatSize(ULONGLONG bytes) {
+    static const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
+    double value = static_cast<double>(bytes);
+    size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < (sizeof(units) / sizeof(units[0]))) {
+        value /= 1024.0;
+        ++unit;
+    }
+
+    wchar_t buffer[64]{};
+    if (unit == 0) {
+        swprintf_s(buffer, L"%llu B", bytes);
+    } else if (value >= 100.0) {
+        swprintf_s(buffer, L"%.0f %s", value, units[unit]);
+    } else if (value >= 10.0) {
+        swprintf_s(buffer, L"%.1f %s", value, units[unit]);
+    } else {
+        swprintf_s(buffer, L"%.2f %s", value, units[unit]);
+    }
+    return buffer;
+}
+
+std::wstring CountText(const FsNode& node) {
+    if (!node.isDirectory) {
         return {};
     }
-    if (slash == 2 && path.size() >= 3 && path[1] == L':') {
-        return path.substr(0, 3);
-    }
-    if (slash == 0) {
-        return path.substr(0, 1);
-    }
-    return path.substr(0, slash);
+    std::wstringstream out;
+    out << node.directFiles << L" 文件 / "
+        << node.directDirectories << L" 文件夹";
+    return out.str();
 }
 
-std::wstring LeafName(const std::wstring& path) {
-    const size_t slash = path.find_last_of(L"\\/");
-    if (slash == std::wstring::npos || slash + 1 >= path.size()) {
-        return path;
+std::wstring FileTypeText(const std::wstring& name, bool isDirectory) {
+    if (isDirectory) {
+        return L"文件夹";
     }
-    return path.substr(slash + 1);
+
+    const size_t slash = name.find_last_of(L"\\/");
+    const size_t dot = name.find_last_of(L'.');
+    if (dot == std::wstring::npos ||
+        (slash != std::wstring::npos && dot < slash) ||
+        dot + 1 >= name.size()) {
+        return L"文件";
+    }
+
+    std::wstring ext = name.substr(dot + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) {
+        return static_cast<wchar_t>(std::towupper(c));
+    });
+    return ext + L" 文件";
 }
 
-bool EntryChangesTime(const fmtfix::LogEntry& entry) {
-    return entry.status == fmtfix::EntryStatus::WouldChange ||
-           entry.status == fmtfix::EntryStatus::Changed;
+bool StartsWithDotName(const std::wstring& name) {
+    return !name.empty() && name.front() == L'.';
 }
 
-FILETIME EffectiveAfterTime(const fmtfix::LogEntry& entry, bool& hasTime) {
-    if (entry.hasAfter) {
-        hasTime = true;
-        return entry.after;
-    }
-    if (entry.hasTarget) {
-        hasTime = true;
-        return entry.target;
-    }
-    hasTime = entry.hasBefore;
-    return entry.before;
-}
-
-std::wstring TreeTimeLabel(const std::wstring& name,
-                           bool hasTime,
-                           const FILETIME& time,
-                           const std::wstring& suffix = L"") {
-    std::wstring text = name + L"    —    " + TimeText(hasTime, time);
-    if (!suffix.empty()) {
-        text += L"    " + suffix;
-    }
-    return text;
-}
-
-HTREEITEM InsertTreeNode(HWND tree,
-                         HTREEITEM parent,
-                         const std::wstring& text,
-                         const std::wstring& path,
-                         bool rightTree,
-                         bool changed) {
-    TVINSERTSTRUCTW insert{};
-    insert.hParent = parent;
-    insert.hInsertAfter = TVI_SORT;
-    insert.item.mask = TVIF_TEXT | TVIF_PARAM;
-    insert.item.pszText = const_cast<LPWSTR>(text.c_str());
-    insert.item.lParam = 0;
-
-    if (changed) {
-        insert.item.mask |= TVIF_STATE;
-        insert.item.stateMask = TVIS_BOLD;
-        insert.item.state = TVIS_BOLD;
-    }
-
-    HTREEITEM item = TreeView_InsertItem(tree, &insert);
-    if (item == nullptr) {
-        return nullptr;
-    }
-
-    if (rightTree) {
-        gRightTreeItems[path] = item;
-        gRightItemPaths[item] = path;
-        if (changed) {
-            gRightChangedItems.insert(item);
-        }
-    } else {
-        gLeftTreeItems[path] = item;
-        gLeftItemPaths[item] = path;
-    }
-    return item;
-}
-
-void ExpandTreeAncestors(HWND tree, HTREEITEM item) {
-    for (HTREEITEM parent = TreeView_GetParent(tree, item);
-         parent != nullptr;
-         parent = TreeView_GetParent(tree, parent)) {
-        TreeView_Expand(tree, parent, TVE_EXPAND);
-    }
-}
-
-void UpdatePreviewModeVisibility() {
-    if (gModeChanges != nullptr && gModeTree != nullptr) {
-        CheckRadioButton(
-            GetParent(gModeChanges),
-            IDC_MODE_CHANGES,
-            IDC_MODE_TREE,
-            gTreePreviewMode ? IDC_MODE_TREE : IDC_MODE_CHANGES);
-    }
-    if (gChangeList != nullptr) {
-        ShowWindow(gChangeList, gTreePreviewMode ? SW_HIDE : SW_SHOW);
-    }
-    if (gTargetTree != nullptr) {
-        ShowWindow(gTargetTree, gTreePreviewMode ? SW_SHOW : SW_HIDE);
-    }
-}
-
-void ClearComparisonViews() {
-    if (gCurrentTree != nullptr) {
-        TreeView_DeleteAllItems(gCurrentTree);
-    }
-    if (gTargetTree != nullptr) {
-        TreeView_DeleteAllItems(gTargetTree);
-    }
-    if (gChangeList != nullptr) {
-        ListView_DeleteAllItems(gChangeList);
-    }
-
-    gLeftTreeItems.clear();
-    gRightTreeItems.clear();
-    gLeftItemPaths.clear();
-    gRightItemPaths.clear();
-    gRightChangedItems.clear();
-
-    SetWindowTextW(gCurrentLabel, L"当前目录树 / 参考来源");
-    SetWindowTextW(gTargetLabel, L"Dry Run 变更预览");
-}
-
-void PopulateComparisonViews(const fmtfix::Result& result) {
-    SendMessageW(gCurrentTree, WM_SETREDRAW, FALSE, 0);
-    SendMessageW(gTargetTree, WM_SETREDRAW, FALSE, 0);
-    SendMessageW(gChangeList, WM_SETREDRAW, FALSE, 0);
-
-    ClearComparisonViews();
-
-    std::set<std::wstring> referencedDirectories;
-    for (const auto& entry : result.entries) {
-        if (entry.sourceType == L"directory" && !entry.sourcePath.empty()) {
-            referencedDirectories.insert(entry.sourcePath);
+int ShellIconIndex(const std::wstring& path, bool isDirectory) {
+    SHFILEINFOW info{};
+    const DWORD attrs =
+        isDirectory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    HIMAGELIST images = reinterpret_cast<HIMAGELIST>(
+        SHGetFileInfoW(
+            path.c_str(),
+            attrs,
+            &info,
+            sizeof(info),
+            SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES));
+    if (images != nullptr && gSystemImageList == nullptr) {
+        gSystemImageList = images;
+        if (gTreeGrid != nullptr) {
+            ListView_SetImageList(gTreeGrid, gSystemImageList, LVSIL_SMALL);
         }
     }
+    return images != nullptr ? info.iIcon : -1;
+}
 
-    std::vector<const fmtfix::LogEntry*> directories;
-    directories.reserve(result.entries.size());
-    for (const auto& entry : result.entries) {
-        directories.push_back(&entry);
+bool IsExcludedPath(const std::wstring& path) {
+    for (const auto& excluded : gExcludedPaths) {
+        if (fmtfix::IsPathInside(path, excluded)) {
+            return true;
+        }
     }
-    std::sort(
-        directories.begin(), directories.end(),
-        [](const fmtfix::LogEntry* a, const fmtfix::LogEntry* b) {
-            if (a->directory.size() != b->directory.size()) {
-                return a->directory.size() < b->directory.size();
+    return false;
+}
+
+std::unique_ptr<FsNode> ScanDirectoryNode(
+    const std::wstring& path,
+    const std::wstring& displayName,
+    FsNode* parent) {
+
+    auto node = std::make_unique<FsNode>();
+    node->path = path;
+    node->name = displayName;
+    node->type = L"文件夹";
+    node->isDirectory = true;
+    node->parent = parent;
+    node->excluded = IsExcludedPath(path);
+    node->expanded =
+        parent == nullptr || gExpandedPaths.count(path) != 0;
+    node->iconIndex = ShellIconIndex(path, true);
+
+    WIN32_FILE_ATTRIBUTE_DATA rootData{};
+    if (GetFileAttributesExW(
+            ToExtendedPathForApi(path).c_str(),
+            GetFileExInfoStandard,
+            &rootData)) {
+        node->lastWrite = rootData.ftLastWriteTime;
+    }
+
+    std::wstring pattern = ToExtendedPathForApi(path);
+    if (!pattern.empty() && pattern.back() != L'\\') {
+        pattern.push_back(L'\\');
+    }
+    pattern.push_back(L'*');
+
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileExW(
+        pattern.c_str(),
+        FindExInfoBasic,
+        &data,
+        FindExSearchNameMatch,
+        nullptr,
+        FIND_FIRST_EX_LARGE_FETCH);
+
+    if (find == INVALID_HANDLE_VALUE &&
+        GetLastError() == ERROR_INVALID_PARAMETER) {
+        find = FindFirstFileExW(
+            pattern.c_str(),
+            FindExInfoBasic,
+            &data,
+            FindExSearchNameMatch,
+            nullptr,
+            0);
+    }
+
+    if (find == INVALID_HANDLE_VALUE) {
+        const DWORD code = GetLastError();
+        if (code != ERROR_FILE_NOT_FOUND) {
+            std::wstringstream err;
+            err << L"无法读取（错误 " << code << L"）";
+            node->scanError = err.str();
+        }
+        return node;
+    }
+
+    do {
+        const std::wstring name = data.cFileName;
+        if (name == L"." || name == L".." || StartsWithDotName(name)) {
+            continue;
+        }
+
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            continue;
+        }
+
+        std::wstring childPath = path;
+        if (!childPath.empty() && childPath.back() != L'\\') {
+            childPath.push_back(L'\\');
+        }
+        childPath += name;
+
+        const bool isDirectory =
+            (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+        if (isDirectory) {
+            ++node->directDirectories;
+            auto child = ScanDirectoryNode(childPath, name, node.get());
+            node->size += child->size;
+            node->children.push_back(std::move(child));
+        } else {
+            ++node->directFiles;
+            auto child = std::make_unique<FsNode>();
+            child->path = childPath;
+            child->name = name;
+            child->type = FileTypeText(name, false);
+            child->lastWrite = data.ftLastWriteTime;
+            child->isDirectory = false;
+            child->parent = node.get();
+            child->excluded = node->excluded;
+            child->iconIndex = ShellIconIndex(childPath, false);
+
+            ULARGE_INTEGER fileSize{};
+            fileSize.HighPart = data.nFileSizeHigh;
+            fileSize.LowPart = data.nFileSizeLow;
+            child->size = fileSize.QuadPart;
+            node->size += child->size;
+
+            node->children.push_back(std::move(child));
+        }
+    } while (FindNextFileW(find, &data));
+
+    FindClose(find);
+    return node;
+}
+
+std::wstring RootDisplayName(const std::wstring& root) {
+    std::wstring trimmed = root;
+    while (trimmed.size() > 3 &&
+           (trimmed.back() == L'\\' || trimmed.back() == L'/')) {
+        trimmed.pop_back();
+    }
+    const size_t slash = trimmed.find_last_of(L"\\/");
+    if (slash == std::wstring::npos || slash + 1 >= trimmed.size()) {
+        return trimmed;
+    }
+    return trimmed.substr(slash + 1);
+}
+
+void ApplyResultToNodes(FsNode* node, const fmtfix::Result& result) {
+    if (node == nullptr) {
+        return;
+    }
+
+    for (const auto& entry : result.entries) {
+        if (entry.directory == node->path) {
+            node->willChange =
+                entry.status == fmtfix::EntryStatus::WouldChange ||
+                entry.status == fmtfix::EntryStatus::Changed;
+            node->hasTarget = entry.hasTarget;
+            if (entry.hasTarget) {
+                node->targetTime = entry.target;
             }
-            return a->directory < b->directory;
+        }
+        if (!entry.sourcePath.empty() && entry.sourcePath == node->path) {
+            node->isReference = true;
+        }
+    }
+
+    for (auto& child : node->children) {
+        ApplyResultToNodes(child.get(), result);
+    }
+}
+
+int CompareTextNoCase(const std::wstring& a, const std::wstring& b) {
+    return _wcsicmp(a.c_str(), b.c_str());
+}
+
+int CompareNodesByColumn(const FsNode* a, const FsNode* b) {
+    if (a->isDirectory != b->isDirectory) {
+        return a->isDirectory ? -1 : 1;
+    }
+
+    int cmp = 0;
+    switch (gSortColumn) {
+    case 1:
+        cmp = a->size < b->size ? -1 : (a->size > b->size ? 1 : 0);
+        break;
+    case 2: {
+        const size_t ac = a->directFiles + a->directDirectories;
+        const size_t bc = b->directFiles + b->directDirectories;
+        cmp = ac < bc ? -1 : (ac > bc ? 1 : 0);
+        break;
+    }
+    case 3:
+        cmp = CompareTextNoCase(a->type, b->type);
+        break;
+    case 4: {
+        const ULONGLONG av = FileTimeValue(a->lastWrite);
+        const ULONGLONG bv = FileTimeValue(b->lastWrite);
+        cmp = av < bv ? -1 : (av > bv ? 1 : 0);
+        break;
+    }
+    case 5: {
+        if (a->willChange != b->willChange) {
+            cmp = a->willChange ? -1 : 1;
+        } else {
+            const ULONGLONG av =
+                a->hasTarget ? FileTimeValue(a->targetTime) : 0;
+            const ULONGLONG bv =
+                b->hasTarget ? FileTimeValue(b->targetTime) : 0;
+            cmp = av < bv ? -1 : (av > bv ? 1 : 0);
+        }
+        break;
+    }
+    case 6:
+        cmp = (a->isReference == b->isReference)
+                  ? 0
+                  : (a->isReference ? -1 : 1);
+        break;
+    case 0:
+    default:
+        cmp = CompareTextNoCase(a->name, b->name);
+        break;
+    }
+
+    if (cmp == 0) {
+        cmp = CompareTextNoCase(a->name, b->name);
+    }
+    return gSortAscending ? cmp : -cmp;
+}
+
+void SortNodeChildren(FsNode* node) {
+    if (node == nullptr || !node->isDirectory) {
+        return;
+    }
+
+    std::stable_sort(
+        node->children.begin(),
+        node->children.end(),
+        [](const std::unique_ptr<FsNode>& a,
+           const std::unique_ptr<FsNode>& b) {
+            return CompareNodesByColumn(a.get(), b.get()) < 0;
         });
 
-    size_t changeRows = 0;
-    size_t sourceFiles = 0;
+    for (auto& child : node->children) {
+        SortNodeChildren(child.get());
+    }
+}
 
-    for (const auto* entry : directories) {
-        HTREEITEM leftParent = TVI_ROOT;
-        HTREEITEM rightParent = TVI_ROOT;
+void FlattenVisibleNodes(FsNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    gVisibleNodes.push_back(node);
 
-        if (entry->directory != result.root) {
-            const std::wstring parentPath = ParentPath(entry->directory);
-            auto leftIt = gLeftTreeItems.find(parentPath);
-            auto rightIt = gRightTreeItems.find(parentPath);
-            if (leftIt != gLeftTreeItems.end()) {
-                leftParent = leftIt->second;
-            }
-            if (rightIt != gRightTreeItems.end()) {
-                rightParent = rightIt->second;
-            }
-        }
-
-        std::wstring name =
-            entry->directory == result.root ? result.root : LeafName(entry->directory);
-        std::wstring referenceSuffix;
-        if (referencedDirectories.count(entry->directory) != 0) {
-            referenceSuffix = L"[作为上级参考目录]";
-        }
-
-        const std::wstring leftText =
-            TreeTimeLabel(name, entry->hasBefore, entry->before, referenceSuffix);
-
-        bool hasAfter = false;
-        const FILETIME after = EffectiveAfterTime(*entry, hasAfter);
-        const bool changed = EntryChangesTime(*entry);
-        const std::wstring rightText = TreeTimeLabel(
-            name,
-            hasAfter,
-            after,
-            changed
-                ? (result.mode == fmtfix::Mode::DryRun
-                       ? L"[将修改]"
-                       : L"[已修改]")
-                : referenceSuffix);
-
-        HTREEITEM leftItem = InsertTreeNode(
-            gCurrentTree, leftParent, leftText, entry->directory, false, false);
-        HTREEITEM rightItem = InsertTreeNode(
-            gTargetTree, rightParent, rightText, entry->directory, true, changed);
-
-        if (changed) {
-            AddListRow(
-                gChangeList,
-                entry->directory,
-                TimeText(entry->hasBefore, entry->before),
-                TimeText(entry->hasTarget, entry->target));
-            ++changeRows;
-
-            if (leftItem != nullptr) {
-                ExpandTreeAncestors(gCurrentTree, leftItem);
-            }
-            if (rightItem != nullptr) {
-                ExpandTreeAncestors(gTargetTree, rightItem);
-            }
-        }
+    if (!node->isDirectory || !node->expanded) {
+        return;
     }
 
-    std::set<std::wstring> addedSourceFiles;
+    for (auto& child : node->children) {
+        FlattenVisibleNodes(child.get());
+    }
+}
+
+std::wstring NodeRemark(const FsNode& node) {
+    if (node.excluded) {
+        return L"已排除（不修改）";
+    }
+    if (!node.scanError.empty()) {
+        return node.scanError;
+    }
+    if (node.isReference) {
+        return node.isDirectory ? L"参考目录" : L"参考文件";
+    }
+    return {};
+}
+
+void RebuildTreeGrid() {
+    if (gTreeGrid == nullptr) {
+        return;
+    }
+
+    SendMessageW(gTreeGrid, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(gTreeGrid);
+    gVisibleNodes.clear();
+
+    if (gRootNode != nullptr) {
+        SortNodeChildren(gRootNode.get());
+        FlattenVisibleNodes(gRootNode.get());
+    }
+
+    for (size_t i = 0; i < gVisibleNodes.size(); ++i) {
+        FsNode* node = gVisibleNodes[i];
+
+        LVITEMW item{};
+        item.mask = LVIF_TEXT | LVIF_PARAM;
+        item.iItem = static_cast<int>(i);
+        item.iSubItem = 0;
+        item.pszText = const_cast<LPWSTR>(node->name.c_str());
+        item.lParam = reinterpret_cast<LPARAM>(node);
+        const int row = ListView_InsertItem(gTreeGrid, &item);
+        if (row < 0) {
+            continue;
+        }
+
+        const std::wstring sizeText = FormatSize(node->size);
+        const std::wstring countText = CountText(*node);
+        const std::wstring modified = TimeText(true, node->lastWrite);
+        const std::wstring target =
+            node->willChange && node->hasTarget
+                ? TimeText(true, node->targetTime)
+                : L"";
+        const std::wstring remark = NodeRemark(*node);
+
+        ListView_SetItemText(
+            gTreeGrid, row, 1,
+            const_cast<LPWSTR>(sizeText.c_str()));
+        ListView_SetItemText(
+            gTreeGrid, row, 2,
+            const_cast<LPWSTR>(countText.c_str()));
+        ListView_SetItemText(
+            gTreeGrid, row, 3,
+            const_cast<LPWSTR>(node->type.c_str()));
+        ListView_SetItemText(
+            gTreeGrid, row, 4,
+            const_cast<LPWSTR>(modified.c_str()));
+        ListView_SetItemText(
+            gTreeGrid, row, 5,
+            const_cast<LPWSTR>(target.c_str()));
+        ListView_SetItemText(
+            gTreeGrid, row, 6,
+            const_cast<LPWSTR>(remark.c_str()));
+    }
+
+    SendMessageW(gTreeGrid, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(gTreeGrid, nullptr, TRUE);
+}
+
+void PopulateChangeList(const fmtfix::Result& result) {
+    ListView_DeleteAllItems(gChangeList);
+    size_t changes = 0;
+
     for (const auto& entry : result.entries) {
-        if (entry.sourceType != L"file" ||
-            entry.sourcePath.empty() ||
-            !entry.hasTarget ||
-            addedSourceFiles.count(entry.sourcePath) != 0) {
+        if (entry.status != fmtfix::EntryStatus::WouldChange &&
+            entry.status != fmtfix::EntryStatus::Changed) {
             continue;
         }
 
-        const auto leftParentIt = gLeftTreeItems.find(entry.directory);
-        const auto rightParentIt = gRightTreeItems.find(entry.directory);
-        if (leftParentIt == gLeftTreeItems.end() ||
-            rightParentIt == gRightTreeItems.end()) {
-            continue;
+        std::wstring source;
+        if (!entry.sourcePath.empty()) {
+            source =
+                (entry.sourceType == L"file" ? L"文件: " : L"目录: ") +
+                entry.sourcePath;
         }
 
-        const std::wstring fileText = TreeTimeLabel(
-            LeafName(entry.sourcePath),
-            true,
-            entry.target,
-            L"[参考文件]");
-
-        InsertTreeNode(
-            gCurrentTree,
-            leftParentIt->second,
-            fileText,
-            entry.sourcePath,
-            false,
-            false);
-        InsertTreeNode(
-            gTargetTree,
-            rightParentIt->second,
-            fileText,
-            entry.sourcePath,
-            true,
-            false);
-        addedSourceFiles.insert(entry.sourcePath);
-        ++sourceFiles;
+        AddListRow(
+            gChangeList,
+            entry.directory,
+            TimeText(entry.hasBefore, entry.before),
+            TimeText(entry.hasTarget, entry.target),
+            source);
+        ++changes;
     }
 
-    if (changeRows == 0) {
-        AddListRow(gChangeList, L"（没有需要修改的目录）", L"", L"");
+    if (changes == 0) {
+        AddListRow(gChangeList, L"（没有需要修改的目录）", L"", L"", L"");
     }
 
-    auto leftRoot = gLeftTreeItems.find(result.root);
-    auto rightRoot = gRightTreeItems.find(result.root);
-    if (leftRoot != gLeftTreeItems.end()) {
-        TreeView_Expand(gCurrentTree, leftRoot->second, TVE_EXPAND);
-    }
-    if (rightRoot != gRightTreeItems.end()) {
-        TreeView_Expand(gTargetTree, rightRoot->second, TVE_EXPAND);
-    }
-
-    std::wstringstream leftTitle;
-    leftTitle << L"当前目录树（"
-              << result.entries.size() << L" 个目录";
-    if (sourceFiles > 0) {
-        leftTitle << L"，" << sourceFiles << L" 个参考文件";
-    }
-    leftTitle << L"）";
-    SetWindowTextW(gCurrentLabel, leftTitle.str().c_str());
-
-    std::wstringstream rightTitle;
-    rightTitle << (result.mode == fmtfix::Mode::DryRun
-                       ? L"Dry Run 变更预览"
-                       : L"应用结果")
-               << L"（" << changeRows << L" 项）";
-    SetWindowTextW(gTargetLabel, rightTitle.str().c_str());
-
-    SendMessageW(gCurrentTree, WM_SETREDRAW, TRUE, 0);
-    SendMessageW(gTargetTree, WM_SETREDRAW, TRUE, 0);
-    SendMessageW(gChangeList, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(gCurrentTree, nullptr, TRUE);
-    InvalidateRect(gTargetTree, nullptr, TRUE);
-    InvalidateRect(gChangeList, nullptr, TRUE);
-    UpdatePreviewModeVisibility();
+    std::wstringstream title;
+    title << L"即将修改（" << changes << L" 项）";
+    SetWindowTextW(gTargetLabel, title.str().c_str());
 }
 
-bool FindCounterpartTreeItem(HWND sourceTree,
-                             HTREEITEM sourceItem,
-                             HWND& targetTree,
-                             HTREEITEM& targetItem) {
-    const bool sourceIsLeft = sourceTree == gCurrentTree;
-    const auto& sourceMap = sourceIsLeft ? gLeftItemPaths : gRightItemPaths;
-    const auto& targetMap = sourceIsLeft ? gRightTreeItems : gLeftTreeItems;
+void CountTree(const FsNode* node, size_t& files, size_t& directories) {
+    if (node == nullptr) {
+        return;
+    }
 
-    auto pathIt = sourceMap.find(sourceItem);
-    if (pathIt == sourceMap.end()) {
+    for (const auto& child : node->children) {
+        if (child->isDirectory) {
+            ++directories;
+            CountTree(child.get(), files, directories);
+        } else {
+            ++files;
+        }
+    }
+}
+
+void UpdateRootSummary() {
+    if (gRootNode == nullptr) {
+        SetWindowTextW(gSummary, L"");
+        return;
+    }
+
+    size_t files = 0;
+    size_t directories = 0;
+    CountTree(gRootNode.get(), files, directories);
+
+    std::wstringstream out;
+    out << L"选择：  " << gRootNode->path << L"\r\n"
+        << L"总大小： " << FormatSize(gRootNode->size)
+        << L"    文件： " << files
+        << L"    文件夹： " << directories;
+    if (!gExcludedPaths.empty()) {
+        out << L"    已排除： " << gExcludedPaths.size();
+    }
+    SetWindowTextW(gSummary, out.str().c_str());
+}
+
+int NodeDepth(const FsNode* node) {
+    int depth = 0;
+    for (const FsNode* p = node != nullptr ? node->parent : nullptr;
+         p != nullptr;
+         p = p->parent) {
+        ++depth;
+    }
+    return depth;
+}
+
+bool HasNextSibling(const FsNode* node) {
+    if (node == nullptr || node->parent == nullptr) {
         return false;
     }
 
-    auto itemIt = targetMap.find(pathIt->second);
-    if (itemIt == targetMap.end()) {
-        return false;
+    const auto& siblings = node->parent->children;
+    for (size_t i = 0; i < siblings.size(); ++i) {
+        if (siblings[i].get() == node) {
+            return i + 1 < siblings.size();
+        }
     }
-
-    targetTree = sourceIsLeft ? gTargetTree : gCurrentTree;
-    targetItem = itemIt->second;
-    return true;
+    return false;
 }
 
-void SyncTreeExpansion(HWND sourceTree, HTREEITEM sourceItem, UINT action) {
-    if (gSyncingTrees) {
-        return;
+std::wstring BranchPrefix(const FsNode* node) {
+    if (node == nullptr || node->parent == nullptr) {
+        return {};
     }
 
-    HWND targetTree = nullptr;
-    HTREEITEM targetItem = nullptr;
-    if (!FindCounterpartTreeItem(sourceTree, sourceItem, targetTree, targetItem)) {
-        return;
+    std::vector<const FsNode*> ancestors;
+    for (const FsNode* p = node->parent;
+         p != nullptr && p->parent != nullptr;
+         p = p->parent) {
+        ancestors.push_back(p);
     }
+    std::reverse(ancestors.begin(), ancestors.end());
 
-    gSyncingTrees = true;
-    if (action == TVE_EXPAND || action == TVE_EXPANDPARTIAL) {
-        TreeView_Expand(targetTree, targetItem, TVE_EXPAND);
-    } else if (action == TVE_COLLAPSE) {
-        TreeView_Expand(targetTree, targetItem, TVE_COLLAPSE);
+    std::wstring prefix;
+    for (const FsNode* ancestor : ancestors) {
+        prefix += HasNextSibling(ancestor) ? L"│   " : L"    ";
     }
-    gSyncingTrees = false;
+    prefix += HasNextSibling(node) ? L"├─ " : L"└─ ";
+    return prefix;
 }
 
-void SyncTreeSelection(HWND sourceTree, HTREEITEM sourceItem) {
-    if (gSyncingTrees || sourceItem == nullptr) {
-        return;
+SIZE TextExtent(HDC dc, HFONT font, const std::wstring& text) {
+    SIZE size{};
+    HGDIOBJ old = nullptr;
+    if (font != nullptr) {
+        old = SelectObject(dc, font);
     }
-
-    HWND targetTree = nullptr;
-    HTREEITEM targetItem = nullptr;
-    if (!FindCounterpartTreeItem(sourceTree, sourceItem, targetTree, targetItem)) {
-        return;
+    GetTextExtentPoint32W(
+        dc,
+        text.c_str(),
+        static_cast<int>(text.size()),
+        &size);
+    if (old != nullptr) {
+        SelectObject(dc, old);
     }
-
-    gSyncingTrees = true;
-    TreeView_SelectItem(targetTree, targetItem);
-    gSyncingTrees = false;
+    return size;
 }
 
-LRESULT HandleTargetTreeCustomDraw(NMTVCUSTOMDRAW* draw) {
+COLORREF NodeBackground(const FsNode* node, bool selected) {
+    if (selected) {
+        return GetSysColor(COLOR_HIGHLIGHT);
+    }
+    if (node != nullptr && node->excluded) {
+        return RGB(242, 242, 242);
+    }
+    if (node != nullptr && node->willChange) {
+        return RGB(255, 239, 184);
+    }
+    return GetSysColor(COLOR_WINDOW);
+}
+
+COLORREF NodeTextColor(const FsNode* node, bool selected) {
+    if (selected) {
+        return GetSysColor(COLOR_HIGHLIGHTTEXT);
+    }
+    if (node != nullptr && node->excluded) {
+        return GetSysColor(COLOR_GRAYTEXT);
+    }
+    if (node != nullptr && node->willChange) {
+        return RGB(145, 72, 0);
+    }
+    return GetSysColor(COLOR_WINDOWTEXT);
+}
+
+LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
     if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) {
         return CDRF_NOTIFYITEMDRAW;
     }
 
     if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
-        HTREEITEM item =
-            reinterpret_cast<HTREEITEM>(draw->nmcd.dwItemSpec);
-        if (gRightChangedItems.count(item) != 0) {
-            draw->clrTextBk = RGB(255, 239, 184);
-            draw->clrText = RGB(145, 72, 0);
+        const int row = static_cast<int>(draw->nmcd.dwItemSpec);
+        FsNode* node =
+            row >= 0 && static_cast<size_t>(row) < gVisibleNodes.size()
+                ? gVisibleNodes[static_cast<size_t>(row)]
+                : nullptr;
+        const bool selected =
+            (ListView_GetItemState(gTreeGrid, row, LVIS_SELECTED) &
+             LVIS_SELECTED) != 0;
+        draw->clrTextBk = NodeBackground(node, selected);
+        draw->clrText = NodeTextColor(node, selected);
+        return CDRF_NOTIFYSUBITEMDRAW;
+    }
+
+    if (draw->nmcd.dwDrawStage ==
+        (CDDS_ITEMPREPAINT | CDDS_SUBITEM)) {
+        if (draw->iSubItem != 0) {
+            return CDRF_DODEFAULT;
         }
-        return CDRF_DODEFAULT;
+
+        const int row = static_cast<int>(draw->nmcd.dwItemSpec);
+        if (row < 0 ||
+            static_cast<size_t>(row) >= gVisibleNodes.size()) {
+            return CDRF_DODEFAULT;
+        }
+
+        FsNode* node = gVisibleNodes[static_cast<size_t>(row)];
+        RECT rect{};
+        ListView_GetSubItemRect(
+            gTreeGrid, row, 0, LVIR_BOUNDS, &rect);
+
+        const bool selected =
+            (ListView_GetItemState(gTreeGrid, row, LVIS_SELECTED) &
+             LVIS_SELECTED) != 0;
+        HBRUSH brush =
+            CreateSolidBrush(NodeBackground(node, selected));
+        FillRect(draw->nmcd.hdc, &rect, brush);
+        DeleteObject(brush);
+
+        SetBkMode(draw->nmcd.hdc, TRANSPARENT);
+        SetTextColor(
+            draw->nmcd.hdc,
+            NodeTextColor(node, selected));
+
+        int x = rect.left + ScaleForDpi(gTreeGrid, 5);
+        const std::wstring prefix = BranchPrefix(node);
+        if (!prefix.empty()) {
+            const SIZE prefixSize =
+                TextExtent(draw->nmcd.hdc, gMonoFont, prefix);
+            HGDIOBJ oldFont = SelectObject(
+                draw->nmcd.hdc,
+                gMonoFont != nullptr ? gMonoFont : gFont);
+            TextOutW(
+                draw->nmcd.hdc,
+                x,
+                rect.top + (rect.bottom - rect.top - prefixSize.cy) / 2,
+                prefix.c_str(),
+                static_cast<int>(prefix.size()));
+            SelectObject(draw->nmcd.hdc, oldFont);
+            x += prefixSize.cx;
+        }
+
+        const int boxSize = ScaleForDpi(gTreeGrid, 11);
+        const int boxY =
+            rect.top + (rect.bottom - rect.top - boxSize) / 2;
+        if (node->isDirectory && !node->children.empty()) {
+            RECT box{x, boxY, x + boxSize, boxY + boxSize};
+            FrameRect(
+                draw->nmcd.hdc,
+                &box,
+                GetSysColorBrush(COLOR_BTNSHADOW));
+
+            const int midX = (box.left + box.right) / 2;
+            const int midY = (box.top + box.bottom) / 2;
+            MoveToEx(draw->nmcd.hdc, box.left + 2, midY, nullptr);
+            LineTo(draw->nmcd.hdc, box.right - 2, midY);
+            if (!node->expanded) {
+                MoveToEx(draw->nmcd.hdc, midX, box.top + 2, nullptr);
+                LineTo(draw->nmcd.hdc, midX, box.bottom - 2);
+            }
+        }
+        x += boxSize + ScaleForDpi(gTreeGrid, 5);
+
+        const int iconSize = ScaleForDpi(gTreeGrid, 16);
+        if (gSystemImageList != nullptr && node->iconIndex >= 0) {
+            ImageList_Draw(
+                gSystemImageList,
+                node->iconIndex,
+                draw->nmcd.hdc,
+                x,
+                rect.top + (rect.bottom - rect.top - iconSize) / 2,
+                ILD_TRANSPARENT);
+        }
+        x += iconSize + ScaleForDpi(gTreeGrid, 5);
+
+        RECT textRect = rect;
+        textRect.left = x;
+        DrawTextW(
+            draw->nmcd.hdc,
+            node->name.c_str(),
+            -1,
+            &textRect,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS |
+                DT_NOPREFIX);
+        return CDRF_SKIPDEFAULT;
     }
 
     return CDRF_DODEFAULT;
+}
+
+int TreeToggleXForRow(int row) {
+    if (row < 0 ||
+        static_cast<size_t>(row) >= gVisibleNodes.size()) {
+        return -1;
+    }
+
+    FsNode* node = gVisibleNodes[static_cast<size_t>(row)];
+    RECT rect{};
+    ListView_GetSubItemRect(gTreeGrid, row, 0, LVIR_BOUNDS, &rect);
+
+    HDC dc = GetDC(gTreeGrid);
+    const std::wstring prefix = BranchPrefix(node);
+    const SIZE prefixSize = TextExtent(dc, gMonoFont, prefix);
+    ReleaseDC(gTreeGrid, dc);
+
+    return rect.left +
+           ScaleForDpi(gTreeGrid, 5) +
+           prefixSize.cx;
+}
+
+void ToggleTreeNode(int row) {
+    if (row < 0 ||
+        static_cast<size_t>(row) >= gVisibleNodes.size()) {
+        return;
+    }
+
+    FsNode* node = gVisibleNodes[static_cast<size_t>(row)];
+    if (!node->isDirectory || node->children.empty()) {
+        return;
+    }
+
+    node->expanded = !node->expanded;
+    if (node->expanded) {
+        gExpandedPaths.insert(node->path);
+    } else {
+        gExpandedPaths.erase(node->path);
+    }
+    RebuildTreeGrid();
+}
+
+void SetSubtreeExpanded(FsNode* node, bool expanded) {
+    if (node == nullptr || !node->isDirectory) {
+        return;
+    }
+
+    node->expanded = expanded;
+    if (expanded) {
+        gExpandedPaths.insert(node->path);
+    } else {
+        gExpandedPaths.erase(node->path);
+    }
+
+    for (auto& child : node->children) {
+        if (child->isDirectory) {
+            SetSubtreeExpanded(child.get(), expanded);
+        }
+    }
+}
+
+std::vector<std::wstring> CurrentExclusions() {
+    return std::vector<std::wstring>(
+        gExcludedPaths.begin(),
+        gExcludedPaths.end());
+}
+
+void ResizeTreeGridColumns(HWND hwnd, int width) {
+    if (gTreeGrid == nullptr) {
+        return;
+    }
+
+    const int nameW = std::max(
+        ScaleForDpi(hwnd, 250),
+        width * 31 / 100);
+    const int sizeW = ScaleForDpi(hwnd, 105);
+    const int countW = ScaleForDpi(hwnd, 150);
+    const int typeW = ScaleForDpi(hwnd, 110);
+    const int timeW = ScaleForDpi(hwnd, 165);
+    const int targetW = ScaleForDpi(hwnd, 165);
+    const int remarkW = std::max(
+        ScaleForDpi(hwnd, 130),
+        width - nameW - sizeW - countW - typeW -
+            timeW - targetW - ScaleForDpi(hwnd, 18));
+
+    const int widths[] = {
+        nameW, sizeW, countW, typeW,
+        timeW, targetW, remarkW};
+    for (int i = 0; i < 7; ++i) {
+        ListView_SetColumnWidth(gTreeGrid, i, widths[i]);
+    }
+}
+
+void ResizeChangeListColumns(HWND hwnd, int width) {
+    if (gChangeList == nullptr) {
+        return;
+    }
+
+    const int timeW = ScaleForDpi(hwnd, 155);
+    const int sourceW = std::max(
+        ScaleForDpi(hwnd, 180),
+        width * 30 / 100);
+    const int pathW = std::max(
+        ScaleForDpi(hwnd, 180),
+        width - timeW * 2 - sourceW -
+            ScaleForDpi(hwnd, 18));
+
+    ListView_SetColumnWidth(gChangeList, 0, pathW);
+    ListView_SetColumnWidth(gChangeList, 1, timeW);
+    ListView_SetColumnWidth(gChangeList, 2, timeW);
+    ListView_SetColumnWidth(gChangeList, 3, sourceW);
+}
+
+UINT ShowTreeContextMenu(HWND owner, FsNode* node, POINT screenPoint) {
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr) {
+        return 0;
+    }
+
+    const bool isDirectory = node != nullptr && node->isDirectory;
+    AppendMenuW(
+        menu,
+        MF_STRING | (isDirectory ? 0 : MF_GRAYED),
+        IDM_EXPAND_ALL,
+        L"展开此目录及所有子目录");
+    AppendMenuW(
+        menu,
+        MF_STRING | (isDirectory ? 0 : MF_GRAYED),
+        IDM_COLLAPSE_ALL,
+        L"收缩此目录及所有子目录");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+    if (isDirectory && node->parent != nullptr) {
+        if (gExcludedPaths.count(node->path) != 0) {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                IDM_INCLUDE,
+                L"取消排除该目录");
+        } else {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                IDM_EXCLUDE,
+                L"排除该目录（本次不修改）");
+        }
+    } else {
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_GRAYED,
+            IDM_EXCLUDE,
+            L"排除该目录（本次不修改）");
+    }
+
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        IDM_REFRESH,
+        L"刷新目录并重新 Dry Run");
+
+    const UINT command = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        screenPoint.x,
+        screenPoint.y,
+        0,
+        owner,
+        nullptr);
+    DestroyMenu(menu);
+    return command;
 }
 
 void RunOperation(HWND owner, fmtfix::Mode mode) {
@@ -800,15 +1304,42 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
     }
 
     SetControlsEnabled(false);
-    ClearComparisonViews();
+    ListView_DeleteAllItems(gTreeGrid);
+    ListView_DeleteAllItems(gChangeList);
     SetWindowTextW(gLog, L"");
-    SetStatus(mode == fmtfix::Mode::DryRun ? L"正在预览，请稍候..." : L"正在修改，请稍候...");
+    SetStatus(mode == fmtfix::Mode::DryRun
+                  ? L"正在扫描目录并计算 Dry Run，请稍候..."
+                  : L"正在修改并重新扫描目录，请稍候...");
     UpdateWindow(owner);
 
-    const fmtfix::Result result = fmtfix::ProcessTree(root, mode);
+    for (auto it = gExcludedPaths.begin(); it != gExcludedPaths.end();) {
+        if (!fmtfix::IsPathInside(*it, root)) {
+            it = gExcludedPaths.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    gExpandedPaths.insert(root);
+
+    const fmtfix::Result result =
+        fmtfix::ProcessTree(root, mode, CurrentExclusions());
+
     gLastRoot = root;
     gLastLog = fmtfix::FormatLog(result);
-    PopulateComparisonViews(result);
+
+    gRootNode = ScanDirectoryNode(
+        root,
+        RootDisplayName(root),
+        nullptr);
+    ApplyResultToNodes(gRootNode.get(), result);
+    RebuildTreeGrid();
+    PopulateChangeList(result);
+    UpdateRootSummary();
+
+    std::wstringstream leftTitle;
+    leftTitle << L"目录树"
+              << L"    （黄色行 = 将修改；灰色行 = 已排除）";
+    SetWindowTextW(gCurrentLabel, leftTitle.str().c_str());
 
     std::wstringstream summary;
     summary << (mode == fmtfix::Mode::DryRun ? L"Dry Run 完成" : L"应用完成")
@@ -848,19 +1379,12 @@ void RefreshFonts(HWND hwnd) {
     gMonoFont = CreateAppFont(hwnd, L"Consolas", 9);
 
     for (HWND child : {
-             gRule, gPath, gBrowse, gDryRun, gApply, gCopy, gSave, gStatus,
-             gCurrentLabel, gCurrentTree, gTargetLabel, gChangeList, gTargetTree,
-             gModeChanges, gModeTree, gLogLabel}) {
+             gRule, gSummary, gPath, gBrowse, gDryRun, gApply, gCopy, gSave,
+             gStatus, gCurrentLabel, gTreeGrid, gTargetLabel, gChangeList,
+             gRightToggle, gLogLabel}) {
         ApplyFont(child, gFont);
     }
     ApplyFont(gLog, gMonoFont != nullptr ? gMonoFont : gFont);
-
-    if (gCurrentTree != nullptr) {
-        TreeView_SetItemHeight(gCurrentTree, ScaleForDpi(hwnd, 26));
-    }
-    if (gTargetTree != nullptr) {
-        TreeView_SetItemHeight(gTargetTree, ScaleForDpi(hwnd, 26));
-    }
 
     if (oldFont != nullptr) {
         DeleteObject(oldFont);
@@ -870,45 +1394,54 @@ void RefreshFonts(HWND hwnd) {
     }
 }
 
-void ResizeChangeListColumns(HWND hwnd, int width) {
-    if (gChangeList == nullptr) {
-        return;
-    }
-
-    const int timeWidth = ScaleForDpi(hwnd, 154);
-    const int minPathWidth = ScaleForDpi(hwnd, 180);
-    const int innerPad = ScaleForDpi(hwnd, 12);
-    const int pathWidth =
-        std::max(minPathWidth, width - timeWidth * 2 - innerPad);
-
-    ListView_SetColumnWidth(gChangeList, 0, pathWidth);
-    ListView_SetColumnWidth(gChangeList, 1, timeWidth);
-    ListView_SetColumnWidth(gChangeList, 2, timeWidth);
-}
-
 void LayoutControls(HWND hwnd) {
     RECT rc{};
     GetClientRect(hwnd, &rc);
     const int w = rc.right - rc.left;
     const int h = rc.bottom - rc.top;
 
-    const int margin = ScaleForDpi(hwnd, 16);
-    const int gap = ScaleForDpi(hwnd, 10);
-    const int splitGap = ScaleForDpi(hwnd, 12);
+    const int margin = ScaleForDpi(hwnd, 14);
+    const int gap = ScaleForDpi(hwnd, 8);
+    const int splitGap = ScaleForDpi(hwnd, 10);
     const int rowH = ScaleForDpi(hwnd, 34);
-    const int ruleH = ScaleForDpi(hwnd, 48);
-    const int labelH = ScaleForDpi(hwnd, 24);
-    const int statusH = ScaleForDpi(hwnd, 28);
-    const int browseW = ScaleForDpi(hwnd, 136);
+    const int topInfoH = ScaleForDpi(hwnd, 58);
+    const int labelH = ScaleForDpi(hwnd, 26);
+    const int statusH = ScaleForDpi(hwnd, 27);
+    const int browseW = ScaleForDpi(hwnd, 138);
+    const int toggleW = ScaleForDpi(hwnd, 120);
 
     int y = margin;
-    MoveWindow(gRule, margin, y, std::max(1, w - margin * 2), ruleH, TRUE);
-    y += ruleH + gap;
+
+    const int infoW = std::max(1, w - margin * 2);
+    const int ruleW = std::max(
+        ScaleForDpi(hwnd, 420),
+        infoW * 47 / 100);
+    const int summaryW = std::max(1, infoW - ruleW - splitGap);
+
+    MoveWindow(gRule, margin, y, ruleW, topInfoH, TRUE);
+    MoveWindow(
+        gSummary,
+        margin + ruleW + splitGap,
+        y,
+        summaryW,
+        topInfoH,
+        TRUE);
+    y += topInfoH + gap;
 
     MoveWindow(
-        gPath, margin, y,
-        std::max(1, w - margin * 2 - browseW - gap), rowH, TRUE);
-    MoveWindow(gBrowse, w - margin - browseW, y, browseW, rowH, TRUE);
+        gPath,
+        margin,
+        y,
+        std::max(1, w - margin * 2 - browseW - gap),
+        rowH,
+        TRUE);
+    MoveWindow(
+        gBrowse,
+        w - margin - browseW,
+        y,
+        browseW,
+        rowH,
+        TRUE);
     y += rowH + gap;
 
     int x = margin;
@@ -925,154 +1458,195 @@ void LayoutControls(HWND hwnd) {
     MoveWindow(gSave, x, y, saveW, rowH, TRUE);
     y += rowH + gap;
 
-    MoveWindow(gStatus, margin, y, std::max(1, w - margin * 2), statusH, TRUE);
+    MoveWindow(
+        gStatus,
+        margin,
+        y,
+        std::max(1, w - margin * 2),
+        statusH,
+        TRUE);
     y += statusH + gap;
 
+    const int contentW = std::max(1, w - margin * 2);
     const int contentBottom = std::max(y, h - margin);
-    const int availableH = std::max(ScaleForDpi(hwnd, 260), contentBottom - y);
-    const int logMinH = ScaleForDpi(hwnd, 150);
-    const int listMinH = ScaleForDpi(hwnd, 150);
-    int logH = std::max(logMinH, availableH * 32 / 100);
-    int listH = availableH - labelH * 2 - gap - logH;
-    if (listH < listMinH) {
-        listH = listMinH;
-        logH = std::max(ScaleForDpi(hwnd, 90),
-                        availableH - labelH * 2 - gap - listH);
+    const int availableH =
+        std::max(ScaleForDpi(hwnd, 280), contentBottom - y);
+    const int logMinH = ScaleForDpi(hwnd, 145);
+    const int gridMinH = ScaleForDpi(hwnd, 190);
+    int logH = std::max(logMinH, availableH * 28 / 100);
+    int gridH = availableH - labelH * 2 - gap - logH;
+    if (gridH < gridMinH) {
+        gridH = gridMinH;
+        logH = std::max(
+            ScaleForDpi(hwnd, 90),
+            availableH - labelH * 2 - gap - gridH);
     }
 
-    const int contentW = std::max(1, w - margin * 2);
-    const int leftW = std::max(1, (contentW - splitGap) / 2);
-    const int rightW = std::max(1, contentW - splitGap - leftW);
+    int leftW = contentW;
+    int rightW = 0;
+    if (!gRightCollapsed) {
+        rightW = std::max(
+            ScaleForDpi(hwnd, 360),
+            contentW * 35 / 100);
+        leftW = std::max(
+            ScaleForDpi(hwnd, 520),
+            contentW - rightW - splitGap);
+        rightW = std::max(1, contentW - leftW - splitGap);
+    }
 
-    MoveWindow(gCurrentLabel, margin, y, leftW, labelH, TRUE);
-
-    const int rightX = margin + leftW + splitGap;
-    const int modeChangesW = ScaleForDpi(hwnd, 124);
-    const int modeTreeW = ScaleForDpi(hwnd, 112);
-    const int targetLabelW = std::max(
-        ScaleForDpi(hwnd, 120),
-        rightW - modeChangesW - modeTreeW - gap * 2);
-
-    MoveWindow(gTargetLabel, rightX, y, targetLabelW, labelH, TRUE);
     MoveWindow(
-        gModeChanges,
-        rightX + rightW - modeChangesW - modeTreeW - gap,
+        gCurrentLabel,
+        margin,
         y,
-        modeChangesW,
+        std::max(1, leftW - toggleW - gap),
         labelH,
         TRUE);
-    MoveWindow(
-        gModeTree,
-        rightX + rightW - modeTreeW,
-        y,
-        modeTreeW,
-        labelH,
-        TRUE);
+
+    if (gRightCollapsed) {
+        ShowWindow(gTargetLabel, SW_HIDE);
+        ShowWindow(gChangeList, SW_HIDE);
+        SetWindowTextW(gRightToggle, L"← 显示变更");
+        MoveWindow(
+            gRightToggle,
+            margin + contentW - toggleW,
+            y,
+            toggleW,
+            labelH,
+            TRUE);
+    } else {
+        const int rightX = margin + leftW + splitGap;
+        ShowWindow(gTargetLabel, SW_SHOW);
+        ShowWindow(gChangeList, SW_SHOW);
+        SetWindowTextW(gRightToggle, L"隐藏变更 →");
+        MoveWindow(
+            gRightToggle,
+            rightX + rightW - toggleW,
+            y,
+            toggleW,
+            labelH,
+            TRUE);
+        MoveWindow(
+            gTargetLabel,
+            rightX,
+            y,
+            std::max(1, rightW - toggleW - gap),
+            labelH,
+            TRUE);
+    }
     y += labelH;
 
-    MoveWindow(gCurrentTree, margin, y, leftW, listH, TRUE);
-    MoveWindow(gChangeList, rightX, y, rightW, listH, TRUE);
-    MoveWindow(gTargetTree, rightX, y, rightW, listH, TRUE);
-    ResizeChangeListColumns(hwnd, rightW);
-    y += listH + gap;
+    MoveWindow(gTreeGrid, margin, y, leftW, gridH, TRUE);
+    ResizeTreeGridColumns(hwnd, leftW);
+
+    if (!gRightCollapsed) {
+        const int rightX = margin + leftW + splitGap;
+        MoveWindow(gChangeList, rightX, y, rightW, gridH, TRUE);
+        ResizeChangeListColumns(hwnd, rightW);
+    }
+    y += gridH + gap;
 
     MoveWindow(gLogLabel, margin, y, contentW, labelH, TRUE);
     y += labelH;
 
     MoveWindow(
-        gLog, margin, y, contentW,
-        std::max(ScaleForDpi(hwnd, 80), h - margin - y), TRUE);
+        gLog,
+        margin,
+        y,
+        contentW,
+        std::max(ScaleForDpi(hwnd, 80), h - margin - y),
+        TRUE);
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         gRule = CreateWindowExW(
-            0, L"STATIC",
-            L"规则：有直属文件 → 取最新直属文件时间；无直属文件 → 取最新直属子目录的处理后时间。\r\n"
-            L"空目录不修改；忽略 .git 等点开头项目及 Junction / 符号链接。",
-            WS_CHILD | WS_VISIBLE,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_RULE), nullptr, nullptr);
+            WS_EX_CLIENTEDGE,
+            L"STATIC",
+            L"时间规则\r\n"
+            L"有直属文件 → 取最新直属文件；无直属文件 → 取最新直属子目录。"
+            L"  空目录不修改；忽略 .git 与 Junction / 符号链接。",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_RULE), nullptr, nullptr);
+
+        gSummary = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"STATIC",
+            L"选择：尚未扫描\r\n总大小：—",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_SUMMARY), nullptr, nullptr);
 
         gPath = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_PATH), nullptr, nullptr);
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_PATH), nullptr, nullptr);
 
         gBrowse = CreateWindowExW(
             0, L"BUTTON", L"选择文件夹...",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_BROWSE), nullptr, nullptr);
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_BROWSE), nullptr, nullptr);
 
         gDryRun = CreateWindowExW(
             0, L"BUTTON", L"Dry Run 预览",
             WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_DRYRUN), nullptr, nullptr);
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_DRYRUN), nullptr, nullptr);
 
         gApply = CreateWindowExW(
             0, L"BUTTON", L"应用修改",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_APPLY), nullptr, nullptr);
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_APPLY), nullptr, nullptr);
 
         gCopy = CreateWindowExW(
             0, L"BUTTON", L"复制日志",
             WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_PUSHBUTTON,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_COPY), nullptr, nullptr);
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_COPY), nullptr, nullptr);
 
         gSave = CreateWindowExW(
             0, L"BUTTON", L"保存日志...",
             WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_PUSHBUTTON,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_SAVE), nullptr, nullptr);
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_SAVE), nullptr, nullptr);
 
         gStatus = CreateWindowExW(
             0, L"STATIC", L"先选择文件夹，再执行 Dry Run。",
             WS_CHILD | WS_VISIBLE,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
 
         gCurrentLabel = CreateWindowExW(
-            0, L"STATIC", L"当前目录树 / 参考来源",
+            0, L"STATIC", L"目录树",
             WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(IDC_CURRENT_LABEL), nullptr, nullptr);
 
         gTargetLabel = CreateWindowExW(
-            0, L"STATIC", L"Dry Run 变更预览",
+            0, L"STATIC", L"即将修改（0 项）",
             WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(IDC_TARGET_LABEL), nullptr, nullptr);
 
-        gModeChanges = CreateWindowExW(
-            0, L"BUTTON", L"仅显示变更",
-            WS_CHILD | WS_VISIBLE | WS_GROUP | BS_AUTORADIOBUTTON,
+        gRightToggle = CreateWindowExW(
+            0, L"BUTTON", L"隐藏变更 →",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             0, 0, 0, 0, hwnd,
-            reinterpret_cast<HMENU>(IDC_MODE_CHANGES), nullptr, nullptr);
-
-        gModeTree = CreateWindowExW(
-            0, L"BUTTON", L"目录对照",
-            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-            0, 0, 0, 0, hwnd,
-            reinterpret_cast<HMENU>(IDC_MODE_TREE), nullptr, nullptr);
-
-        const DWORD treeStyle =
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
-            TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
-            TVS_SHOWSELALWAYS | TVS_DISABLEDRAGDROP;
-
-        gCurrentTree = CreateWindowExW(
-            WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
-            treeStyle,
-            0, 0, 0, 0, hwnd,
-            reinterpret_cast<HMENU>(IDC_CURRENT_TREE), nullptr, nullptr);
-
-        gTargetTree = CreateWindowExW(
-            WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
-            treeStyle,
-            0, 0, 0, 0, hwnd,
-            reinterpret_cast<HMENU>(IDC_TARGET_TREE), nullptr, nullptr);
+            reinterpret_cast<HMENU>(IDC_RIGHT_TOGGLE), nullptr, nullptr);
 
         const DWORD listStyle =
             WS_CHILD | WS_VISIBLE | WS_TABSTOP |
             LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS;
+
+        gTreeGrid = CreateWindowExW(
+            WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            listStyle,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_TREEGRID), nullptr, nullptr);
 
         gChangeList = CreateWindowExW(
             WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
@@ -1081,12 +1655,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             reinterpret_cast<HMENU>(IDC_CHANGE_LIST), nullptr, nullptr);
 
         const DWORD listExtendedStyle =
-            LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER;
+            LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES |
+            LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP;
+        ListView_SetExtendedListViewStyle(gTreeGrid, listExtendedStyle);
         ListView_SetExtendedListViewStyle(gChangeList, listExtendedStyle);
+
+        AddListColumn(gTreeGrid, 0, L"文件夹 / 文件");
+        AddListColumn(gTreeGrid, 1, L"大小");
+        AddListColumn(gTreeGrid, 2, L"数量");
+        AddListColumn(gTreeGrid, 3, L"类型");
+        AddListColumn(gTreeGrid, 4, L"修改时间");
+        AddListColumn(gTreeGrid, 5, L"即将修改");
+        AddListColumn(gTreeGrid, 6, L"备注");
 
         AddListColumn(gChangeList, 0, L"即将修改的目录");
         AddListColumn(gChangeList, 1, L"修改前");
         AddListColumn(gChangeList, 2, L"修改后");
+        AddListColumn(gChangeList, 3, L"参考来源");
 
         gLogLabel = CreateWindowExW(
             0, L"STATIC", L"详细日志",
@@ -1097,12 +1682,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         gLog = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
-            ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_LOG), nullptr, nullptr);
-        SendMessageW(gLog, EM_SETLIMITTEXT, 50u * 1024u * 1024u, 0);
+            ES_MULTILINE | ES_AUTOVSCROLL |
+            ES_AUTOHSCROLL | ES_READONLY,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_LOG), nullptr, nullptr);
+        SendMessageW(
+            gLog,
+            EM_SETLIMITTEXT,
+            50u * 1024u * 1024u,
+            0);
 
         RefreshFonts(hwnd);
-        UpdatePreviewModeVisibility();
 
         // Start with the current working directory as a convenience.
         DWORD needed = GetCurrentDirectoryW(0, nullptr);
@@ -1150,6 +1740,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             std::wstring chosen;
             if (BrowseForFolder(hwnd, chosen)) {
                 SetWindowTextW(gPath, chosen.c_str());
+                gExpandedPaths.clear();
+                gExcludedPaths.clear();
+                gRootNode.reset();
+                gVisibleNodes.clear();
+                ListView_DeleteAllItems(gTreeGrid);
+                ListView_DeleteAllItems(gChangeList);
+                SetWindowTextW(
+                    gSummary,
+                    (L"选择：  " + chosen + L"\r\n总大小：尚未扫描").c_str());
+                SetStatus(L"已选择文件夹，请执行 Dry Run。");
             }
             return 0;
         }
@@ -1165,17 +1765,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_SAVE:
             SaveLogAs(hwnd);
             return 0;
-        case IDC_MODE_CHANGES:
-            if (HIWORD(wParam) == BN_CLICKED) {
-                gTreePreviewMode = false;
-                UpdatePreviewModeVisibility();
-            }
-            return 0;
-        case IDC_MODE_TREE:
-            if (HIWORD(wParam) == BN_CLICKED) {
-                gTreePreviewMode = true;
-                UpdatePreviewModeVisibility();
-            }
+        case IDC_RIGHT_TOGGLE:
+            gRightCollapsed = !gRightCollapsed;
+            LayoutControls(hwnd);
             return 0;
         default:
             break;
@@ -1189,27 +1781,97 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
 
-        if (header->hwndFrom == gCurrentTree ||
-            header->hwndFrom == gTargetTree) {
-            if (header->code == TVN_ITEMEXPANDEDW) {
-                auto* tree = reinterpret_cast<NMTREEVIEWW*>(lParam);
-                SyncTreeExpansion(
-                    header->hwndFrom,
-                    tree->itemNew.hItem,
-                    tree->action);
+        if (header->hwndFrom == gTreeGrid) {
+            if (header->code == NM_CUSTOMDRAW) {
+                return HandleTreeGridCustomDraw(
+                    reinterpret_cast<NMLVCUSTOMDRAW*>(lParam));
+            }
+
+            if (header->code == LVN_COLUMNCLICK) {
+                auto* click = reinterpret_cast<NMLISTVIEW*>(lParam);
+                if (gSortColumn == click->iSubItem) {
+                    gSortAscending = !gSortAscending;
+                } else {
+                    gSortColumn = click->iSubItem;
+                    gSortAscending = true;
+                }
+                RebuildTreeGrid();
                 return 0;
             }
 
-            if (header->code == TVN_SELCHANGEDW) {
-                auto* tree = reinterpret_cast<NMTREEVIEWW*>(lParam);
-                SyncTreeSelection(header->hwndFrom, tree->itemNew.hItem);
+            if (header->code == NM_CLICK) {
+                auto* click = reinterpret_cast<NMITEMACTIVATE*>(lParam);
+                const int row = click->iItem;
+                if (row >= 0 &&
+                    click->iSubItem == 0 &&
+                    static_cast<size_t>(row) < gVisibleNodes.size()) {
+                    FsNode* node = gVisibleNodes[static_cast<size_t>(row)];
+                    if (node->isDirectory && !node->children.empty()) {
+                        const int toggleX = TreeToggleXForRow(row);
+                        const int boxSize = ScaleForDpi(gTreeGrid, 14);
+                        if (click->ptAction.x >= toggleX &&
+                            click->ptAction.x <= toggleX + boxSize) {
+                            ToggleTreeNode(row);
+                        }
+                    }
+                }
                 return 0;
             }
 
-            if (header->hwndFrom == gTargetTree &&
-                header->code == NM_CUSTOMDRAW) {
-                return HandleTargetTreeCustomDraw(
-                    reinterpret_cast<NMTVCUSTOMDRAW*>(lParam));
+            if (header->code == NM_DBLCLK) {
+                auto* click = reinterpret_cast<NMITEMACTIVATE*>(lParam);
+                if (click->iItem >= 0 &&
+                    click->iSubItem == 0 &&
+                    static_cast<size_t>(click->iItem) < gVisibleNodes.size()) {
+                    ToggleTreeNode(click->iItem);
+                }
+                return 0;
+            }
+
+            if (header->code == NM_RCLICK) {
+                POINT pt{};
+                GetCursorPos(&pt);
+
+                POINT client = pt;
+                ScreenToClient(gTreeGrid, &client);
+                LVHITTESTINFO hit{};
+                hit.pt = client;
+                const int row = ListView_HitTest(gTreeGrid, &hit);
+
+                FsNode* node = nullptr;
+                if (row >= 0 &&
+                    static_cast<size_t>(row) < gVisibleNodes.size()) {
+                    node = gVisibleNodes[static_cast<size_t>(row)];
+                    ListView_SetItemState(
+                        gTreeGrid,
+                        row,
+                        LVIS_SELECTED | LVIS_FOCUSED,
+                        LVIS_SELECTED | LVIS_FOCUSED);
+                }
+
+                const UINT command =
+                    ShowTreeContextMenu(hwnd, node, pt);
+                if (command == IDM_EXPAND_ALL && node != nullptr) {
+                    SetSubtreeExpanded(node, true);
+                    RebuildTreeGrid();
+                } else if (command == IDM_COLLAPSE_ALL &&
+                           node != nullptr) {
+                    SetSubtreeExpanded(node, false);
+                    RebuildTreeGrid();
+                } else if (command == IDM_EXCLUDE &&
+                           node != nullptr &&
+                           node->isDirectory &&
+                           node->parent != nullptr) {
+                    gExcludedPaths.insert(node->path);
+                    RunOperation(hwnd, fmtfix::Mode::DryRun);
+                } else if (command == IDM_INCLUDE &&
+                           node != nullptr) {
+                    gExcludedPaths.erase(node->path);
+                    RunOperation(hwnd, fmtfix::Mode::DryRun);
+                } else if (command == IDM_REFRESH) {
+                    RunOperation(hwnd, fmtfix::Mode::DryRun);
+                }
+                return 0;
             }
         }
         break;

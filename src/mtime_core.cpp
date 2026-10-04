@@ -233,8 +233,16 @@ bool EnumerateDirectChildren(
 
 class Processor {
 public:
-    Processor(std::wstring root, Mode mode)
-        : root_(std::move(root)), mode_(mode) {
+    Processor(
+        std::wstring root,
+        Mode mode,
+        std::vector<std::wstring> excludedDirectories)
+        : root_(std::move(root)),
+          mode_(mode),
+          excludedDirectories_(std::move(excludedDirectories)) {
+        for (auto& path : excludedDirectories_) {
+            path = TrimTrailingSlashes(std::move(path));
+        }
         result_.root = root_;
         result_.mode = mode_;
     }
@@ -245,7 +253,37 @@ public:
     }
 
 private:
+    bool IsExcluded(const std::wstring& directory) const {
+        for (const auto& excluded : excludedDirectories_) {
+            if (_wcsicmp(directory.c_str(), excluded.c_str()) == 0) {
+                return true;
+            }
+
+            std::wstring prefix = excluded;
+            if (!prefix.empty() && prefix.back() != L'\\') {
+                prefix.push_back(L'\\');
+            }
+
+            if (directory.size() > prefix.size() &&
+                _wcsnicmp(directory.c_str(), prefix.c_str(), prefix.size()) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     ProcessOutcome ProcessDirectory(const std::wstring& directory) {
+        if (IsExcluded(directory)) {
+            FILETIME current{};
+            std::wstring error;
+            ProcessOutcome outcome;
+            if (GetPathLastWriteTime(directory, current, error)) {
+                outcome.hasEffectiveTime = true;
+                outcome.effectiveTime = current;
+            }
+            return outcome;
+        }
+
         result_.summary.directories++;
 
         FILETIME before{};
@@ -454,6 +492,7 @@ private:
 
     std::wstring root_;
     Mode mode_;
+    std::vector<std::wstring> excludedDirectories_;
     Result result_;
 };
 
@@ -467,8 +506,14 @@ std::wstring NormalizeForCompare(std::wstring path) {
 
 } // namespace
 
-Result ProcessTree(const std::wstring& root, Mode mode) {
-    Processor processor(TrimTrailingSlashes(root), mode);
+Result ProcessTree(
+    const std::wstring& root,
+    Mode mode,
+    const std::vector<std::wstring>& excludedDirectories) {
+    Processor processor(
+        TrimTrailingSlashes(root),
+        mode,
+        excludedDirectories);
     return processor.Run();
 }
 

@@ -57,7 +57,10 @@ struct Result {
 //     fileless directories, but stops at any directory that has direct files.
 //   - Empty directories are unchanged.
 //   - Dot-prefixed entries (e.g. .git) and reparse points are ignored.
-Result ProcessTree(const std::wstring& root, Mode mode);
+Result ProcessTree(
+    const std::wstring& root,
+    Mode mode,
+    const std::vector<std::wstring>& excludedDirectories = {});
 
 std::wstring FormatFileTimeLocal(const FILETIME& ft);
 std::wstring FormatLog(const Result& result);
