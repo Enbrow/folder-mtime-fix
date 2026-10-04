@@ -47,6 +47,7 @@ constexpr int IDC_CHANGE_LIST = 1013;
 constexpr int IDC_LOG_LABEL = 1014;
 constexpr int IDC_RIGHT_TOGGLE = 1015;
 constexpr int IDC_SUMMARY = 1016;
+constexpr int IDC_LOG_TOGGLE = 1017;
 
 constexpr UINT IDM_EXPAND_ALL = 2001;
 constexpr UINT IDM_COLLAPSE_ALL = 2002;
@@ -70,12 +71,14 @@ HWND gTargetLabel = nullptr;
 HWND gChangeList = nullptr;
 HWND gRightToggle = nullptr;
 HWND gLogLabel = nullptr;
+HWND gLogToggle = nullptr;
 HFONT gFont = nullptr;
 HFONT gMonoFont = nullptr;
 HIMAGELIST gSystemImageList = nullptr;
 std::wstring gLastLog;
 std::wstring gLastRoot;
 bool gRightCollapsed = false;
+bool gLogCollapsed = false;
 int gSortColumn = 0;
 bool gSortAscending = true;
 std::set<std::wstring> gExpandedPaths;
@@ -1000,10 +1003,23 @@ int TreeIndentPixels() {
     return ScaleForDpi(gTreeGrid, 18);
 }
 
+int TreeBoxSizePixels() {
+    return ScaleForDpi(gTreeGrid, 11);
+}
+
 int TreeNodeBoxX(const FsNode* node, const RECT& rect) {
-    return rect.left +
-           ScaleForDpi(gTreeGrid, 5) +
-           TreeDepth(node) * TreeIndentPixels();
+    const int baseX = rect.left + ScaleForDpi(gTreeGrid, 5);
+    const int depth = TreeDepth(node);
+    if (depth <= 0) {
+        return baseX;
+    }
+
+    // From level 1 onward, put the expand/collapse box directly on the
+    // connector's vertical axis. This matches the classic TreeView/WizTree
+    // geometry: the guide line runs through the center of the box.
+    const int centerX =
+        baseX + depth * TreeIndentPixels() + TreeIndentPixels() / 2;
+    return centerX - TreeBoxSizePixels() / 2;
 }
 
 void DrawTreeBranches(
@@ -1021,6 +1037,7 @@ void DrawTreeBranches(
     }
 
     const int indent = TreeIndentPixels();
+    const int boxSize = TreeBoxSizePixels();
     const int baseX = rect.left + ScaleForDpi(gTreeGrid, 5);
     const int midY = (rect.top + rect.bottom) / 2;
 
@@ -1032,36 +1049,44 @@ void DrawTreeBranches(
     }
     std::reverse(ancestors.begin(), ancestors.end());
 
-    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    // WizTree/TreeView-like dotted guide lines.
+    HPEN pen = CreatePen(PS_DOT, 1, color);
     if (pen == nullptr) {
         return;
     }
     HGDIOBJ oldPen = SelectObject(dc, pen);
+    const int oldBkMode = SetBkMode(dc, TRANSPARENT);
 
-    // Continuation lines for ancestor levels.
+    // Continuation lines for ancestor levels. ancestors[0] is level 1.
     for (size_t i = 0; i < ancestors.size(); ++i) {
         if (!HasNextSibling(ancestors[i])) {
             continue;
         }
         const int x =
-            baseX + static_cast<int>(i) * indent + indent / 2;
+            baseX +
+            (static_cast<int>(i) + 1) * indent +
+            indent / 2;
         MoveToEx(dc, x, rect.top, nullptr);
         LineTo(dc, x, rect.bottom);
     }
 
-    // Branch for this row. Both the vertical and horizontal strokes share the
-    // exact same X/Y pixel, so deeper levels cannot drift like text glyphs do.
+    // Current branch axis goes through the exact center of the node box.
     const int branchX =
-        baseX + (depth - 1) * indent + indent / 2;
+        baseX + depth * indent + indent / 2;
     MoveToEx(dc, branchX, rect.top, nullptr);
     LineTo(
         dc,
         branchX,
         HasNextSibling(node) ? rect.bottom : midY + 1);
 
+    // Draw a short dotted arm toward the icon. The expand box is painted after
+    // this and covers the middle portion, leaving the guide visually attached
+    // to the box center without drawing through the box interior.
+    const int boxRight = TreeNodeBoxX(node, rect) + boxSize;
     MoveToEx(dc, branchX, midY, nullptr);
-    LineTo(dc, TreeNodeBoxX(node, rect), midY);
+    LineTo(dc, boxRight + ScaleForDpi(gTreeGrid, 4), midY);
 
+    SetBkMode(dc, oldBkMode);
     SelectObject(dc, oldPen);
     DeleteObject(pen);
 }
@@ -1181,7 +1206,7 @@ LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
             draw->nmcd.hdc,
             NodeTextColor(node, selected));
 
-        const int boxSize = ScaleForDpi(gTreeGrid, 11);
+        const int boxSize = TreeBoxSizePixels();
         DrawTreeBranches(
             draw->nmcd.hdc,
             node,
@@ -1195,6 +1220,13 @@ LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
             rect.top + (rect.bottom - rect.top - boxSize) / 2;
         if (node->isDirectory && !node->children.empty()) {
             RECT box{x, boxY, x + boxSize, boxY + boxSize};
+
+            // Cover the dotted guide inside the box, while keeping the guide
+            // perfectly centered on the box's X axis.
+            HBRUSH boxBrush =
+                CreateSolidBrush(NodeBackground(node, selected));
+            FillRect(draw->nmcd.hdc, &box, boxBrush);
+            DeleteObject(boxBrush);
             FrameRect(
                 draw->nmcd.hdc,
                 &box,
@@ -1551,7 +1583,7 @@ void RefreshFonts(HWND hwnd) {
     for (HWND child : {
              gRule, gSummary, gPath, gBrowse, gDryRun, gApply, gCopy, gSave,
              gStatus, gCurrentLabel, gTreeGrid, gTargetLabel, gChangeList,
-             gRightToggle, gLogLabel}) {
+             gRightToggle, gLogLabel, gLogToggle}) {
         ApplyFont(child, gFont);
     }
     ApplyFont(gLog, gMonoFont != nullptr ? gMonoFont : gFont);
@@ -1643,13 +1675,23 @@ void LayoutControls(HWND hwnd) {
         std::max(ScaleForDpi(hwnd, 280), contentBottom - y);
     const int logMinH = ScaleForDpi(hwnd, 145);
     const int gridMinH = ScaleForDpi(hwnd, 190);
-    int logH = std::max(logMinH, availableH * 28 / 100);
-    int gridH = availableH - labelH * 2 - gap - logH;
-    if (gridH < gridMinH) {
-        gridH = gridMinH;
-        logH = std::max(
-            ScaleForDpi(hwnd, 90),
-            availableH - labelH * 2 - gap - gridH);
+    int logH = 0;
+    int gridH = 0;
+    if (gLogCollapsed) {
+        // Keep only the log title/toggle row and give all remaining height to
+        // the main Tree-Grid / changes panes.
+        gridH = std::max(
+            gridMinH,
+            availableH - labelH * 2 - gap);
+    } else {
+        logH = std::max(logMinH, availableH * 28 / 100);
+        gridH = availableH - labelH * 2 - gap - logH;
+        if (gridH < gridMinH) {
+            gridH = gridMinH;
+            logH = std::max(
+                ScaleForDpi(hwnd, 90),
+                availableH - labelH * 2 - gap - gridH);
+        }
     }
 
     int leftW = contentW;
@@ -1715,16 +1757,36 @@ void LayoutControls(HWND hwnd) {
     }
     y += gridH + gap;
 
-    MoveWindow(gLogLabel, margin, y, contentW, labelH, TRUE);
-    y += labelH;
-
     MoveWindow(
-        gLog,
+        gLogLabel,
         margin,
         y,
-        contentW,
-        std::max(ScaleForDpi(hwnd, 80), h - margin - y),
+        std::max(1, contentW - toggleW - gap),
+        labelH,
         TRUE);
+    MoveWindow(
+        gLogToggle,
+        margin + contentW - toggleW,
+        y,
+        toggleW,
+        labelH,
+        TRUE);
+
+    if (gLogCollapsed) {
+        SetWindowTextW(gLogToggle, L"展开日志 ↓");
+        ShowWindow(gLog, SW_HIDE);
+    } else {
+        SetWindowTextW(gLogToggle, L"收起日志 ↑");
+        ShowWindow(gLog, SW_SHOW);
+        y += labelH;
+        MoveWindow(
+            gLog,
+            margin,
+            y,
+            contentW,
+            std::max(ScaleForDpi(hwnd, 80), h - margin - y),
+            TRUE);
+    }
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1857,6 +1919,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(IDC_LOG_LABEL), nullptr, nullptr);
 
+        gLogToggle = CreateWindowExW(
+            0, L"BUTTON", L"收起日志 ↑",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(IDC_LOG_TOGGLE), nullptr, nullptr);
+
         gLog = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
@@ -1945,6 +2013,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case IDC_RIGHT_TOGGLE:
             gRightCollapsed = !gRightCollapsed;
+            LayoutControls(hwnd);
+            return 0;
+        case IDC_LOG_TOGGLE:
+            gLogCollapsed = !gLogCollapsed;
             LayoutControls(hwnd);
             return 0;
         default:
