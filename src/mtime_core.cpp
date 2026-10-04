@@ -357,36 +357,50 @@ private:
         std::wstring sourceType;
         std::wstring sourcePath;
 
-        if (!files.empty()) {
-            // If direct files exist, they win. Child-directory times are
-            // intentionally ignored; this is the requested Windows-like rule.
-            const ChildInfo* newest = &files.front();
-            for (const auto& file : files) {
-                if (FileTimeGreater(file.discoveredTime, newest->discoveredTime)) {
-                    newest = &file;
-                }
+        const ChildInfo* newestFile = nullptr;
+        for (const auto& file : files) {
+            if (newestFile == nullptr ||
+                FileTimeGreater(
+                    file.discoveredTime,
+                    newestFile->discoveredTime)) {
+                newestFile = &file;
             }
+        }
+
+        const ChildOutcome* newestChild = nullptr;
+        for (const auto& child : childOutcomes) {
+            if (!child.valid) {
+                continue;
+            }
+            if (newestChild == nullptr ||
+                FileTimeGreater(
+                    child.effectiveTime,
+                    newestChild->effectiveTime)) {
+                newestChild = &child;
+            }
+        }
+
+        if (newestFile != nullptr) {
             hasTarget = true;
-            target = newest->discoveredTime;
+            target = newestFile->discoveredTime;
             sourceType = L"file";
-            sourcePath = newest->path;
-        } else if (!ignoreDirectSubdirectoryTimes_ &&
-                   !childOutcomes.empty()) {
-            const ChildOutcome* newest = nullptr;
-            for (const auto& child : childOutcomes) {
-                if (!child.valid) {
-                    continue;
-                }
-                if (newest == nullptr || FileTimeGreater(child.effectiveTime, newest->effectiveTime)) {
-                    newest = &child;
-                }
-            }
-            if (newest != nullptr) {
-                hasTarget = true;
-                target = newest->effectiveTime;
-                sourceType = L"directory";
-                sourcePath = newest->path;
-            }
+            sourcePath = newestFile->path;
+        }
+
+        // Default/original rule:
+        //   - If direct files exist, ignore direct child-directory times.
+        //   - If there are no direct files, the newest direct child directory
+        //     is still used, allowing propagation through fileless levels.
+        // Optional unchecked UI mode:
+        //   - Compare direct files and direct child directories together.
+        if (newestChild != nullptr &&
+            (!ignoreDirectSubdirectoryTimes_ || newestFile == nullptr) &&
+            (!hasTarget ||
+             FileTimeGreater(newestChild->effectiveTime, target))) {
+            hasTarget = true;
+            target = newestChild->effectiveTime;
+            sourceType = L"directory";
+            sourcePath = newestChild->path;
         }
 
         LogEntry entry;

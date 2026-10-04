@@ -152,14 +152,16 @@ void UpdateRuleText() {
         SetWindowTextW(
             gRule,
             L"时间规则\r\n"
-            L"有直属文件 → 取最新直属文件；无直属文件 → 不参考直属子目录。"
-            L"  不逐级上传递；空目录不修改；忽略 .git 与 Junction / 符号链接。");
+            L"有直属文件 → 只取最新直属文件，忽略直属子目录；"
+            L"无直属文件 → 取最新直属子目录。"
+            L"  空目录不修改；忽略 .git 与 Junction / 符号链接。");
     } else {
         SetWindowTextW(
             gRule,
             L"时间规则\r\n"
-            L"有直属文件 → 取最新直属文件；无直属文件 → 取最新直属子目录。"
-            L"  可逐级上传递；空目录不修改；忽略 .git 与 Junction / 符号链接。");
+            L"直属文件 + 直属子目录一起比较，取最新时间；"
+            L"无直属文件 → 取最新直属子目录。"
+            L"  空目录不修改；忽略 .git 与 Junction / 符号链接。");
     }
 }
 
@@ -1583,16 +1585,15 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
     if (mode == fmtfix::Mode::Apply) {
         std::wstring message =
             L"即将实际修改以下目录树中的文件夹“修改时间”：\n\n" + root +
-            L"\n\n规则：\n"
-            L"• 有直属文件：使用最新直属文件时间，忽略子目录时间。\n";
+            L"\n\n规则：\n";
         if (ignoreDirectSubdirectoryTimes) {
             message +=
-                L"• 没有直属文件：忽略直属子目录时间，不修改该目录。\n"
-                L"• 不会通过文件夹时间逐级向上传递。\n";
+                L"• 有直属文件时：只比较直属文件，忽略直属子目录时间。\n"
+                L"• 没有直属文件时：使用最新直属子目录的处理后时间。\n";
         } else {
             message +=
-                L"• 没有直属文件：使用最新直属子目录的处理后时间。\n"
-                L"• 文件夹时间可以逐级向上传递。\n";
+                L"• 直属文件与直属子目录一起比较，使用其中最新的时间。\n"
+                L"• 没有直属文件时：使用最新直属子目录的处理后时间。\n";
         }
         message +=
             L"• 空目录不修改。\n"

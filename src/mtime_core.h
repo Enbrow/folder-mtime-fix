@@ -51,13 +51,13 @@ struct Result {
 
 // Restores directory LastWriteTime using the rule agreed with the user:
 //   - Process child directories before parents.
-//   - If a directory has one or more direct, non-dot, non-reparse files,
-//     use the newest of those files and ignore child-directory times.
-//   - If ignoreDirectSubdirectoryTimes is true (default), a directory with no
-//     direct files is left unchanged even if it has child directories.
-//   - If ignoreDirectSubdirectoryTimes is false, a fileless directory uses the
-//     newest direct child's effective post-processing time. This can propagate
-//     through a chain of fileless directories.
+//   - If direct files exist and ignoreDirectSubdirectoryTimes is true
+//     (default), use only the newest direct file and ignore direct child
+//     directory times.
+//   - If there are no direct files, use the newest direct child's effective
+//     post-processing time; this preserves propagation through fileless levels.
+//   - If ignoreDirectSubdirectoryTimes is false, compare direct files and
+//     direct child directories together and use whichever is newest.
 //   - Empty directories are unchanged.
 //   - Dot-prefixed entries (e.g. .git) and reparse points are ignored.
 //   - Excluded directories are not processed recursively; their current
