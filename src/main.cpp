@@ -7,6 +7,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shobjidl.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <cstring>
