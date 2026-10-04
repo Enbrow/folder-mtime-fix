@@ -1152,6 +1152,11 @@ COLORREF NodeBackground(const FsNode* node, bool selected) {
     if (node != nullptr && node->willChange) {
         return RGB(255, 239, 184);
     }
+    if (node != nullptr && node->isReference) {
+        // Reference-source rows use a cool blue tint so they are immediately
+        // distinguishable from the warm yellow "will change" rows.
+        return RGB(226, 240, 255);
+    }
     return GetSysColor(COLOR_WINDOW);
 }
 
@@ -1164,6 +1169,9 @@ COLORREF NodeTextColor(const FsNode* node, bool selected) {
     }
     if (node != nullptr && node->willChange) {
         return RGB(145, 72, 0);
+    }
+    if (node != nullptr && node->isReference) {
+        return RGB(35, 82, 125);
     }
     return GetSysColor(COLOR_WINDOWTEXT);
 }
@@ -1591,7 +1599,7 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
     std::wstringstream leftTitle;
     leftTitle << L"目录树    （黄色行 = "
               << (mode == fmtfix::Mode::DryRun ? L"将修改" : L"已修改")
-              << L"；灰色行 = 已排除）";
+              << L"；蓝色行 = 参考来源；灰色行 = 已排除）";
     SetWindowTextW(gCurrentLabel, leftTitle.str().c_str());
 
     std::wstringstream summary;
@@ -1904,7 +1912,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
 
         gCurrentLabel = CreateWindowExW(
-            0, L"STATIC", L"目录树",
+            0, L"STATIC", L"目录树    （黄色行 = 将修改；蓝色行 = 参考来源；灰色行 = 已排除）",
             WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(IDC_CURRENT_LABEL), nullptr, nullptr);
