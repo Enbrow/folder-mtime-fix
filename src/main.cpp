@@ -795,14 +795,14 @@ void UpdateTreeGridSortIndicator() {
     for (int i = 0; i < count; ++i) {
         HDITEMW item{};
         item.mask = HDI_FORMAT;
-        if (!Header_GetItemW(header, i, &item)) {
+        if (!Header_GetItem(header, i, &item)) {
             continue;
         }
         item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
         if (i == gSortColumn) {
             item.fmt |= gSortAscending ? HDF_SORTUP : HDF_SORTDOWN;
         }
-        Header_SetItemW(header, i, &item);
+        Header_SetItem(header, i, &item);
     }
 }
 
