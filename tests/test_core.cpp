@@ -156,8 +156,9 @@ int wmain() {
     TempDir temp = MakeTempRoot();
 
     // Scenario 1:
-    // A has a direct old file, B has a newer file.
-    // B should become 2025; A must stay governed by its direct 2024 file.
+    // A has a direct old file, while child directory B resolves to a newer
+    // time. The default checked option must preserve the original rule: direct
+    // files win and direct child-directory times are ignored.
     const std::wstring A = Join(temp.path, L"A");
     const std::wstring B = Join(A, L"B");
     const std::wstring oldFile = Join(A, L"old.txt");
@@ -175,23 +176,56 @@ int wmain() {
     const auto preview1 = fmtfix::ProcessTree(A, fmtfix::Mode::DryRun);
     const auto* eA = FindEntry(preview1, A);
     const auto* eB = FindEntry(preview1, B);
-    ok &= Expect(eA && eA->hasTarget && EqualTime(eA->target, t2024), "A preview target must be direct file time (2024)");
-    ok &= Expect(eB && eB->hasTarget && EqualTime(eB->target, t2025), "B preview target must be direct file time (2025)");
+    ok &= Expect(
+        preview1.ignoreDirectSubdirectoryTimes,
+        "Direct child-directory times must be ignored by default");
+    ok &= Expect(
+        eA && eA->hasTarget && EqualTime(eA->target, t2024) &&
+            _wcsicmp(eA->sourcePath.c_str(), oldFile.c_str()) == 0,
+        "Default A target must come from its direct file (2024)");
+    ok &= Expect(
+        eB && eB->hasTarget && EqualTime(eB->target, t2025),
+        "B preview target must be direct file time (2025)");
 
     FILETIME beforeA{}, beforeB{};
     GetPathTime(A, beforeA); GetPathTime(B, beforeB);
-    ok &= Expect(EqualTime(beforeA, t2026) && EqualTime(beforeB, t2026), "Dry-run must not modify directory times");
+    ok &= Expect(
+        EqualTime(beforeA, t2026) && EqualTime(beforeB, t2026),
+        "Dry-run must not modify directory times");
 
     const auto apply1 = fmtfix::ProcessTree(A, fmtfix::Mode::Apply);
     FILETIME afterA{}, afterB{};
     GetPathTime(A, afterA); GetPathTime(B, afterB);
-    ok &= Expect(EqualTime(afterA, t2024), "A apply result must be 2024");
-    ok &= Expect(EqualTime(afterB, t2025), "B apply result must be 2025");
+    ok &= Expect(EqualTime(afterA, t2024), "Default A apply result must be 2024");
+    ok &= Expect(EqualTime(afterB, t2025), "Default B apply result must be 2025");
     ok &= Expect(apply1.summary.errors == 0, "Scenario 1 should have no errors");
 
+    // Unchecking the option makes both direct files and direct child
+    // directories candidates. B (2025) is newer than old.txt (2024), so A
+    // must now reference B.
+    const auto preview1WithChildDirs =
+        fmtfix::ProcessTree(A, fmtfix::Mode::DryRun, {}, false);
+    const auto* eAWithChildDirs = FindEntry(preview1WithChildDirs, A);
+    ok &= Expect(
+        !preview1WithChildDirs.ignoreDirectSubdirectoryTimes,
+        "Combined file/directory mode must be recorded in the result");
+    ok &= Expect(
+        eAWithChildDirs && eAWithChildDirs->hasTarget &&
+            EqualTime(eAWithChildDirs->target, t2025) &&
+            eAWithChildDirs->sourceType == L"directory" &&
+            _wcsicmp(eAWithChildDirs->sourcePath.c_str(), B.c_str()) == 0,
+        "Unchecked mode must let newer child B beat direct old.txt");
+
+    fmtfix::ProcessTree(A, fmtfix::Mode::Apply, {}, false);
+    GetPathTime(A, afterA); GetPathTime(B, afterB);
+    ok &= Expect(
+        EqualTime(afterA, t2025) && EqualTime(afterB, t2025),
+        "Unchecked mode must update A from the newer direct child directory");
+
     // Scenario 2:
-    // C and D have no direct files; D contains deep.txt.
-    // The time is allowed to propagate through a chain of fileless directories.
+    // C has no direct files and D contains deep.txt. The original/default rule
+    // still propagates through fileless directory levels; the checkbox only
+    // changes what happens when direct files and child directories coexist.
     const std::wstring C = Join(temp.path, L"C");
     const std::wstring D = Join(C, L"D");
     const std::wstring deep = Join(D, L"deep.txt");
@@ -204,14 +238,31 @@ int wmain() {
     const auto preview2 = fmtfix::ProcessTree(C, fmtfix::Mode::DryRun);
     const auto* eC = FindEntry(preview2, C);
     const auto* eD = FindEntry(preview2, D);
-    ok &= Expect(eD && eD->hasTarget && EqualTime(eD->target, t2025), "D preview target must be deep file time");
-    ok &= Expect(eC && eC->hasTarget && EqualTime(eC->target, t2025), "C preview must simulate D post-processing time");
+    ok &= Expect(
+        eD && eD->hasTarget && EqualTime(eD->target, t2025),
+        "D preview target must be deep file time");
+    ok &= Expect(
+        eC && eC->hasTarget && EqualTime(eC->target, t2025) &&
+            _wcsicmp(eC->sourcePath.c_str(), D.c_str()) == 0,
+        "Default C preview must inherit D because C has no direct files");
 
     fmtfix::ProcessTree(C, fmtfix::Mode::Apply);
     FILETIME afterC{}, afterD{};
     GetPathTime(C, afterC); GetPathTime(D, afterD);
-    ok &= Expect(EqualTime(afterD, t2025), "D apply result must be 2025");
-    ok &= Expect(EqualTime(afterC, t2025), "C apply result must be 2025");
+    ok &= Expect(
+        EqualTime(afterD, t2025) && EqualTime(afterC, t2025),
+        "Default mode must propagate through fileless levels");
+
+    // Unchecked mode behaves the same here because C has no direct files.
+    SetPathTime(D, t2023, true);
+    SetPathTime(C, t2023, true);
+    const auto preview2WithChildDirs =
+        fmtfix::ProcessTree(C, fmtfix::Mode::DryRun, {}, false);
+    const auto* eCWithChildDirs = FindEntry(preview2WithChildDirs, C);
+    ok &= Expect(
+        eCWithChildDirs && eCWithChildDirs->hasTarget &&
+            EqualTime(eCWithChildDirs->target, t2025),
+        "Unchecked mode must also propagate through fileless levels");
 
     // Scenario 3: an empty directory stays unchanged.
     const std::wstring Empty = Join(temp.path, L"Empty");
@@ -235,6 +286,64 @@ int wmain() {
     FILETIME dotAfter{};
     GetPathTime(Dot, dotAfter);
     ok &= Expect(EqualTime(dotAfter, t2024), "Dot-prefixed file must be ignored");
+
+    // Scenario 5: excluded directory and its subtree are not modified.
+    // Because E has no direct files, both checkbox modes may use excluded F's
+    // current directory time as E's direct-child reference.
+    const std::wstring E = Join(temp.path, L"E");
+    const std::wstring F = Join(E, L"F");
+    const std::wstring G = Join(F, L"G");
+    const std::wstring excludedFile = Join(F, L"excluded.txt");
+    const std::wstring nestedExcludedFile = Join(G, L"nested.txt");
+    MakeDir(E); MakeDir(F); MakeDir(G);
+    MakeFile(excludedFile); MakeFile(nestedExcludedFile);
+    SetPathTime(excludedFile, t2025, false);
+    SetPathTime(nestedExcludedFile, t2026, false);
+    SetPathTime(G, t2024, true);
+    SetPathTime(F, t2023, true);
+    SetPathTime(E, t2026, true);
+
+    const auto excludedPreview =
+        fmtfix::ProcessTree(E, fmtfix::Mode::DryRun, {F});
+    FILETIME previewE{}, previewF{}, previewG{};
+    GetPathTime(E, previewE); GetPathTime(F, previewF); GetPathTime(G, previewG);
+    const auto* previewExcludedParent = FindEntry(excludedPreview, E);
+    ok &= Expect(
+        EqualTime(previewE, t2026) && EqualTime(previewF, t2023) &&
+            EqualTime(previewG, t2024),
+        "Dry-run with exclusion must not modify parent or excluded subtree");
+    ok &= Expect(
+        previewExcludedParent && previewExcludedParent->hasTarget &&
+            EqualTime(previewExcludedParent->target, t2023),
+        "Default mode must use excluded F because E has no direct files");
+    ok &= Expect(
+        FindEntry(excludedPreview, F) == nullptr &&
+            FindEntry(excludedPreview, G) == nullptr,
+        "Excluded directory subtree must not be logged during dry-run");
+
+    const auto excludedResult =
+        fmtfix::ProcessTree(E, fmtfix::Mode::Apply, {F});
+    FILETIME afterE{}, afterF{}, afterG{};
+    GetPathTime(E, afterE); GetPathTime(F, afterF); GetPathTime(G, afterG);
+    ok &= Expect(
+        EqualTime(afterE, t2023) &&
+            EqualTime(afterF, t2023) && EqualTime(afterG, t2024),
+        "Default mode may update E but must preserve excluded subtree times");
+    ok &= Expect(
+        FindEntry(excludedResult, F) == nullptr &&
+            FindEntry(excludedResult, G) == nullptr,
+        "Excluded directory subtree must not be logged as processed");
+
+    SetPathTime(E, t2026, true);
+    const auto excludedCombinedPreview =
+        fmtfix::ProcessTree(E, fmtfix::Mode::DryRun, {F}, false);
+    const auto* combinedExcludedParent =
+        FindEntry(excludedCombinedPreview, E);
+    ok &= Expect(
+        combinedExcludedParent &&
+            combinedExcludedParent->hasTarget &&
+            EqualTime(combinedExcludedParent->target, t2023),
+        "Unchecked mode must behave the same when the parent has no files");
 
     if (!ok) {
         return 1;

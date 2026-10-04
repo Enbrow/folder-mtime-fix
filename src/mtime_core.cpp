@@ -233,10 +233,22 @@ bool EnumerateDirectChildren(
 
 class Processor {
 public:
-    Processor(std::wstring root, Mode mode)
-        : root_(std::move(root)), mode_(mode) {
+    Processor(
+        std::wstring root,
+        Mode mode,
+        std::vector<std::wstring> excludedDirectories,
+        bool ignoreDirectSubdirectoryTimes)
+        : root_(std::move(root)),
+          mode_(mode),
+          excludedDirectories_(std::move(excludedDirectories)),
+          ignoreDirectSubdirectoryTimes_(ignoreDirectSubdirectoryTimes) {
+        for (auto& path : excludedDirectories_) {
+            path = TrimTrailingSlashes(std::move(path));
+        }
         result_.root = root_;
         result_.mode = mode_;
+        result_.ignoreDirectSubdirectoryTimes =
+            ignoreDirectSubdirectoryTimes_;
     }
 
     Result Run() {
@@ -245,7 +257,37 @@ public:
     }
 
 private:
+    bool IsExcluded(const std::wstring& directory) const {
+        for (const auto& excluded : excludedDirectories_) {
+            if (_wcsicmp(directory.c_str(), excluded.c_str()) == 0) {
+                return true;
+            }
+
+            std::wstring prefix = excluded;
+            if (!prefix.empty() && prefix.back() != L'\\') {
+                prefix.push_back(L'\\');
+            }
+
+            if (directory.size() > prefix.size() &&
+                _wcsnicmp(directory.c_str(), prefix.c_str(), prefix.size()) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     ProcessOutcome ProcessDirectory(const std::wstring& directory) {
+        if (IsExcluded(directory)) {
+            FILETIME current{};
+            std::wstring error;
+            ProcessOutcome outcome;
+            if (GetPathLastWriteTime(directory, current, error)) {
+                outcome.hasEffectiveTime = true;
+                outcome.effectiveTime = current;
+            }
+            return outcome;
+        }
+
         result_.summary.directories++;
 
         FILETIME before{};
@@ -315,35 +357,50 @@ private:
         std::wstring sourceType;
         std::wstring sourcePath;
 
-        if (!files.empty()) {
-            // If direct files exist, they win. Child-directory times are
-            // intentionally ignored; this is the requested Windows-like rule.
-            const ChildInfo* newest = &files.front();
-            for (const auto& file : files) {
-                if (FileTimeGreater(file.discoveredTime, newest->discoveredTime)) {
-                    newest = &file;
-                }
+        const ChildInfo* newestFile = nullptr;
+        for (const auto& file : files) {
+            if (newestFile == nullptr ||
+                FileTimeGreater(
+                    file.discoveredTime,
+                    newestFile->discoveredTime)) {
+                newestFile = &file;
             }
+        }
+
+        const ChildOutcome* newestChild = nullptr;
+        for (const auto& child : childOutcomes) {
+            if (!child.valid) {
+                continue;
+            }
+            if (newestChild == nullptr ||
+                FileTimeGreater(
+                    child.effectiveTime,
+                    newestChild->effectiveTime)) {
+                newestChild = &child;
+            }
+        }
+
+        if (newestFile != nullptr) {
             hasTarget = true;
-            target = newest->discoveredTime;
+            target = newestFile->discoveredTime;
             sourceType = L"file";
-            sourcePath = newest->path;
-        } else if (!childOutcomes.empty()) {
-            const ChildOutcome* newest = nullptr;
-            for (const auto& child : childOutcomes) {
-                if (!child.valid) {
-                    continue;
-                }
-                if (newest == nullptr || FileTimeGreater(child.effectiveTime, newest->effectiveTime)) {
-                    newest = &child;
-                }
-            }
-            if (newest != nullptr) {
-                hasTarget = true;
-                target = newest->effectiveTime;
-                sourceType = L"directory";
-                sourcePath = newest->path;
-            }
+            sourcePath = newestFile->path;
+        }
+
+        // Default/original rule:
+        //   - If direct files exist, ignore direct child-directory times.
+        //   - If there are no direct files, the newest direct child directory
+        //     is still used, allowing propagation through fileless levels.
+        // Optional unchecked UI mode:
+        //   - Compare direct files and direct child directories together.
+        if (newestChild != nullptr &&
+            (!ignoreDirectSubdirectoryTimes_ || newestFile == nullptr) &&
+            (!hasTarget ||
+             FileTimeGreater(newestChild->effectiveTime, target))) {
+            hasTarget = true;
+            target = newestChild->effectiveTime;
+            sourceType = L"directory";
+            sourcePath = newestChild->path;
         }
 
         LogEntry entry;
@@ -454,6 +511,8 @@ private:
 
     std::wstring root_;
     Mode mode_;
+    std::vector<std::wstring> excludedDirectories_;
+    bool ignoreDirectSubdirectoryTimes_ = true;
     Result result_;
 };
 
@@ -467,8 +526,16 @@ std::wstring NormalizeForCompare(std::wstring path) {
 
 } // namespace
 
-Result ProcessTree(const std::wstring& root, Mode mode) {
-    Processor processor(TrimTrailingSlashes(root), mode);
+Result ProcessTree(
+    const std::wstring& root,
+    Mode mode,
+    const std::vector<std::wstring>& excludedDirectories,
+    bool ignoreDirectSubdirectoryTimes) {
+    Processor processor(
+        TrimTrailingSlashes(root),
+        mode,
+        excludedDirectories,
+        ignoreDirectSubdirectoryTimes);
     return processor.Run();
 }
 
@@ -508,6 +575,9 @@ std::wstring FormatLog(const Result& result) {
     std::wstringstream out;
     out << L"# FolderMTimeFix\r\n";
     out << L"# mode=" << (result.mode == Mode::DryRun ? L"dry-run" : L"apply") << L"\r\n";
+    out << L"# ignore_direct_subdirectory_times="
+        << (result.ignoreDirectSubdirectoryTimes ? L"true" : L"false")
+        << L"\r\n";
     out << L"# root=\"" << result.root << L"\"\r\n\r\n";
 
     for (const auto& entry : result.entries) {

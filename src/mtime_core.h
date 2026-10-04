@@ -44,20 +44,29 @@ struct Summary {
 struct Result {
     std::wstring root;
     Mode mode = Mode::DryRun;
+    bool ignoreDirectSubdirectoryTimes = true;
     std::vector<LogEntry> entries;
     Summary summary;
 };
 
 // Restores directory LastWriteTime using the rule agreed with the user:
 //   - Process child directories before parents.
-//   - If a directory has one or more direct, non-dot, non-reparse files,
-//     use the newest of those files and ignore child-directory times.
-//   - Otherwise, if it has direct child directories, use the newest child's
-//     effective post-processing time. This can propagate through a chain of
-//     fileless directories, but stops at any directory that has direct files.
+//   - If direct files exist and ignoreDirectSubdirectoryTimes is true
+//     (default), use only the newest direct file and ignore direct child
+//     directory times.
+//   - If there are no direct files, use the newest direct child's effective
+//     post-processing time; this preserves propagation through fileless levels.
+//   - If ignoreDirectSubdirectoryTimes is false, compare direct files and
+//     direct child directories together and use whichever is newest.
 //   - Empty directories are unchanged.
 //   - Dot-prefixed entries (e.g. .git) and reparse points are ignored.
-Result ProcessTree(const std::wstring& root, Mode mode);
+//   - Excluded directories are not processed recursively; their current
+//     directory timestamp can still be used as a direct parent's reference.
+Result ProcessTree(
+    const std::wstring& root,
+    Mode mode,
+    const std::vector<std::wstring>& excludedDirectories = {},
+    bool ignoreDirectSubdirectoryTimes = true);
 
 std::wstring FormatFileTimeLocal(const FILETIME& ft);
 std::wstring FormatLog(const Result& result);
