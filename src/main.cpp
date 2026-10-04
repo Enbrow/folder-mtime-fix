@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <cstring>
 #include <cwctype>
-#include <map>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -522,6 +521,28 @@ bool IsExcludedPath(const std::wstring& path) {
     return false;
 }
 
+bool IsExplicitlyExcludedPath(const std::wstring& path) {
+    for (const auto& excluded : gExcludedPaths) {
+        if (_wcsicmp(path.c_str(), excluded.c_str()) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void AddExclusionPath(const std::wstring& path) {
+    // A parent exclusion already covers its descendants. Drop redundant child
+    // exclusions so cancelling the parent later has predictable semantics.
+    for (auto it = gExcludedPaths.begin(); it != gExcludedPaths.end();) {
+        if (fmtfix::IsPathInside(*it, path)) {
+            it = gExcludedPaths.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    gExcludedPaths.insert(path);
+}
+
 std::unique_ptr<FsNode> ScanDirectoryNode(
     const std::wstring& path,
     const std::wstring& displayName,
@@ -628,7 +649,13 @@ std::unique_ptr<FsNode> ScanDirectoryNode(
         }
     } while (FindNextFileW(find, &data));
 
+    const DWORD endCode = GetLastError();
     FindClose(find);
+    if (endCode != ERROR_NO_MORE_FILES) {
+        std::wstringstream err;
+        err << L"目录扫描未完整结束（错误 " << endCode << L"）";
+        node->scanError = err.str();
+    }
     return node;
 }
 
@@ -674,7 +701,29 @@ int CompareTextNoCase(const std::wstring& a, const std::wstring& b) {
     return _wcsicmp(a.c_str(), b.c_str());
 }
 
+std::wstring NodeRemark(const FsNode& node) {
+    std::wstring remark;
+    if (node.excluded) {
+        remark = L"已排除（不修改）";
+    }
+    if (!node.scanError.empty()) {
+        if (!remark.empty()) {
+            remark += L"；";
+        }
+        remark += node.scanError;
+    }
+    if (node.isReference) {
+        if (!remark.empty()) {
+            remark += L"；";
+        }
+        remark += node.isDirectory ? L"参考目录" : L"参考文件";
+    }
+    return remark;
+}
+
 int CompareNodesByColumn(const FsNode* a, const FsNode* b) {
+    // Keep folders before files regardless of ascending/descending order so
+    // sorting never destroys the tree-grid's directory-first structure.
     if (a->isDirectory != b->isDirectory) {
         return a->isDirectory ? -1 : 1;
     }
@@ -712,9 +761,7 @@ int CompareNodesByColumn(const FsNode* a, const FsNode* b) {
         break;
     }
     case 6:
-        cmp = (a->isReference == b->isReference)
-                  ? 0
-                  : (a->isReference ? -1 : 1);
+        cmp = CompareTextNoCase(NodeRemark(*a), NodeRemark(*b));
         break;
     case 0:
     default:
@@ -722,10 +769,41 @@ int CompareNodesByColumn(const FsNode* a, const FsNode* b) {
         break;
     }
 
+    cmp = gSortAscending ? cmp : -cmp;
     if (cmp == 0) {
+        // Keep name as a deterministic tie-breaker without reversing the
+        // directory/file grouping above.
         cmp = CompareTextNoCase(a->name, b->name);
+        if (!gSortAscending) {
+            cmp = -cmp;
+        }
     }
-    return gSortAscending ? cmp : -cmp;
+    return cmp;
+}
+
+void UpdateTreeGridSortIndicator() {
+    if (gTreeGrid == nullptr) {
+        return;
+    }
+
+    HWND header = ListView_GetHeader(gTreeGrid);
+    if (header == nullptr) {
+        return;
+    }
+
+    const int count = Header_GetItemCount(header);
+    for (int i = 0; i < count; ++i) {
+        HDITEMW item{};
+        item.mask = HDI_FORMAT;
+        if (!Header_GetItemW(header, i, &item)) {
+            continue;
+        }
+        item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+        if (i == gSortColumn) {
+            item.fmt |= gSortAscending ? HDF_SORTUP : HDF_SORTDOWN;
+        }
+        Header_SetItemW(header, i, &item);
+    }
 }
 
 void SortNodeChildren(FsNode* node) {
@@ -759,19 +837,6 @@ void FlattenVisibleNodes(FsNode* node) {
     for (auto& child : node->children) {
         FlattenVisibleNodes(child.get());
     }
-}
-
-std::wstring NodeRemark(const FsNode& node) {
-    if (node.excluded) {
-        return L"已排除（不修改）";
-    }
-    if (!node.scanError.empty()) {
-        return node.scanError;
-    }
-    if (node.isReference) {
-        return node.isDirectory ? L"参考目录" : L"参考文件";
-    }
-    return {};
 }
 
 void RebuildTreeGrid() {
@@ -866,7 +931,8 @@ void PopulateChangeList(const fmtfix::Result& result) {
     }
 
     std::wstringstream title;
-    title << L"即将修改（" << changes << L" 项）";
+    title << (result.mode == fmtfix::Mode::DryRun ? L"即将修改（" : L"已修改（")
+          << changes << L" 项）";
     SetWindowTextW(gTargetLabel, title.str().c_str());
 }
 
@@ -904,16 +970,6 @@ void UpdateRootSummary() {
         out << L"    已排除： " << gExcludedPaths.size();
     }
     SetWindowTextW(gSummary, out.str().c_str());
-}
-
-int NodeDepth(const FsNode* node) {
-    int depth = 0;
-    for (const FsNode* p = node != nullptr ? node->parent : nullptr;
-         p != nullptr;
-         p = p->parent) {
-        ++depth;
-    }
-    return depth;
 }
 
 bool HasNextSibling(const FsNode* node) {
@@ -994,6 +1050,31 @@ COLORREF NodeTextColor(const FsNode* node, bool selected) {
     return GetSysColor(COLOR_WINDOWTEXT);
 }
 
+bool GetTreeCellRect(int row, RECT& rect) {
+    if (gTreeGrid == nullptr || row < 0) {
+        return false;
+    }
+
+    RECT rowRect{};
+    if (!ListView_GetItemRect(gTreeGrid, row, &rowRect, LVIR_BOUNDS)) {
+        return false;
+    }
+
+    HWND header = ListView_GetHeader(gTreeGrid);
+    RECT columnRect{};
+    if (header == nullptr || !Header_GetItemRect(header, 0, &columnRect)) {
+        return false;
+    }
+
+    // Header_GetItemRect follows the current header order/position, so the
+    // custom tree cell keeps working even after the user drags column 0.
+    rect.left = columnRect.left;
+    rect.right = columnRect.right;
+    rect.top = rowRect.top;
+    rect.bottom = rowRect.bottom;
+    return true;
+}
+
 LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
     if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) {
         return CDRF_NOTIFYITEMDRAW;
@@ -1027,8 +1108,9 @@ LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
 
         FsNode* node = gVisibleNodes[static_cast<size_t>(row)];
         RECT rect{};
-        ListView_GetSubItemRect(
-            gTreeGrid, row, 0, LVIR_BOUNDS, &rect);
+        if (!GetTreeCellRect(row, rect)) {
+            return CDRF_DODEFAULT;
+        }
 
         const bool selected =
             (ListView_GetItemState(gTreeGrid, row, LVIS_SELECTED) &
@@ -1117,7 +1199,9 @@ int TreeToggleXForRow(int row) {
 
     FsNode* node = gVisibleNodes[static_cast<size_t>(row)];
     RECT rect{};
-    ListView_GetSubItemRect(gTreeGrid, row, 0, LVIR_BOUNDS, &rect);
+    if (!GetTreeCellRect(row, rect)) {
+        return -1;
+    }
 
     HDC dc = GetDC(gTreeGrid);
     const std::wstring prefix = BranchPrefix(node);
@@ -1240,12 +1324,18 @@ UINT ShowTreeContextMenu(HWND owner, FsNode* node, POINT screenPoint) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
     if (isDirectory && node->parent != nullptr) {
-        if (gExcludedPaths.count(node->path) != 0) {
+        if (IsExplicitlyExcludedPath(node->path)) {
             AppendMenuW(
                 menu,
                 MF_STRING,
                 IDM_INCLUDE,
                 L"取消排除该目录");
+        } else if (node->excluded) {
+            AppendMenuW(
+                menu,
+                MF_STRING | MF_GRAYED,
+                IDM_EXCLUDE,
+                L"已随父目录排除");
         } else {
             AppendMenuW(
                 menu,
@@ -1338,8 +1428,9 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
     UpdateRootSummary();
 
     std::wstringstream leftTitle;
-    leftTitle << L"目录树"
-              << L"    （黄色行 = 将修改；灰色行 = 已排除）";
+    leftTitle << L"目录树    （黄色行 = "
+              << (mode == fmtfix::Mode::DryRun ? L"将修改" : L"已修改")
+              << L"；灰色行 = 已排除）";
     SetWindowTextW(gCurrentLabel, leftTitle.str().c_str());
 
     std::wstringstream summary;
@@ -1668,6 +1759,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         AddListColumn(gTreeGrid, 4, L"修改时间");
         AddListColumn(gTreeGrid, 5, L"即将修改");
         AddListColumn(gTreeGrid, 6, L"备注");
+        UpdateTreeGridSortIndicator();
 
         AddListColumn(gChangeList, 0, L"即将修改的目录");
         AddListColumn(gChangeList, 1, L"修改前");
@@ -1796,6 +1888,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     gSortColumn = click->iSubItem;
                     gSortAscending = true;
                 }
+                UpdateTreeGridSortIndicator();
                 RebuildTreeGrid();
                 return 0;
             }
@@ -1863,7 +1956,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                            node != nullptr &&
                            node->isDirectory &&
                            node->parent != nullptr) {
-                    gExcludedPaths.insert(node->path);
+                    AddExclusionPath(node->path);
                     RunOperation(hwnd, fmtfix::Mode::DryRun);
                 } else if (command == IDM_INCLUDE &&
                            node != nullptr) {

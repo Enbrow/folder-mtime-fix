@@ -57,6 +57,8 @@ struct Result {
 //     fileless directories, but stops at any directory that has direct files.
 //   - Empty directories are unchanged.
 //   - Dot-prefixed entries (e.g. .git) and reparse points are ignored.
+//   - Excluded directories are not processed recursively; their current
+//     directory timestamp can still be used as a direct parent's reference.
 Result ProcessTree(
     const std::wstring& root,
     Mode mode,

@@ -240,25 +240,49 @@ int wmain() {
     // Its current directory time may still act as the parent's reference time.
     const std::wstring E = Join(temp.path, L"E");
     const std::wstring F = Join(E, L"F");
+    const std::wstring G = Join(F, L"G");
     const std::wstring excludedFile = Join(F, L"excluded.txt");
-    MakeDir(E); MakeDir(F); MakeFile(excludedFile);
+    const std::wstring nestedExcludedFile = Join(G, L"nested.txt");
+    MakeDir(E); MakeDir(F); MakeDir(G);
+    MakeFile(excludedFile); MakeFile(nestedExcludedFile);
     SetPathTime(excludedFile, t2025, false);
+    SetPathTime(nestedExcludedFile, t2026, false);
+    SetPathTime(G, t2024, true);
     SetPathTime(F, t2023, true);
     SetPathTime(E, t2026, true);
 
+    const auto excludedPreview =
+        fmtfix::ProcessTree(E, fmtfix::Mode::DryRun, {F});
+    FILETIME previewE{}, previewF{}, previewG{};
+    GetPathTime(E, previewE); GetPathTime(F, previewF); GetPathTime(G, previewG);
+    const auto* previewExcludedParent = FindEntry(excludedPreview, E);
+    ok &= Expect(
+        EqualTime(previewE, t2026) && EqualTime(previewF, t2023) &&
+            EqualTime(previewG, t2024),
+        "Dry-run with exclusion must not modify parent or excluded subtree");
+    ok &= Expect(
+        previewExcludedParent && previewExcludedParent->hasTarget &&
+            EqualTime(previewExcludedParent->target, t2023),
+        "Dry-run parent must preview the excluded child's current time");
+    ok &= Expect(
+        FindEntry(excludedPreview, F) == nullptr &&
+            FindEntry(excludedPreview, G) == nullptr,
+        "Excluded directory subtree must not be logged during dry-run");
+
     const auto excludedResult =
         fmtfix::ProcessTree(E, fmtfix::Mode::Apply, {F});
-    FILETIME afterE{}, afterF{};
-    GetPathTime(E, afterE); GetPathTime(F, afterF);
+    FILETIME afterE{}, afterF{}, afterG{};
+    GetPathTime(E, afterE); GetPathTime(F, afterF); GetPathTime(G, afterG);
     ok &= Expect(
-        EqualTime(afterF, t2023),
-        "Excluded directory must keep its original time");
+        EqualTime(afterF, t2023) && EqualTime(afterG, t2024),
+        "Excluded directory subtree must keep its original times");
     ok &= Expect(
         EqualTime(afterE, t2023),
         "Parent may use excluded child's current time as reference");
     ok &= Expect(
-        FindEntry(excludedResult, F) == nullptr,
-        "Excluded directory must not be logged as processed");
+        FindEntry(excludedResult, F) == nullptr &&
+            FindEntry(excludedResult, G) == nullptr,
+        "Excluded directory subtree must not be logged as processed");
 
     if (!ok) {
         return 1;
