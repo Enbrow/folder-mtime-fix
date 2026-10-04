@@ -1010,13 +1010,11 @@ int TreeBoxSizePixels() {
 int TreeNodeBoxX(const FsNode* node, const RECT& rect) {
     const int baseX = rect.left + ScaleForDpi(gTreeGrid, 5);
     const int depth = TreeDepth(node);
-    if (depth <= 0) {
-        return baseX;
-    }
 
-    // From level 1 onward, put the expand/collapse box directly on the
-    // connector's vertical axis. This matches the classic TreeView/WizTree
-    // geometry: the guide line runs through the center of the box.
+    // Put every level, including the root, on the same indentation grid.
+    // Previously depth 0 used baseX directly while child levels used the
+    // half-indent center line, making root -> level 1 slightly wider than
+    // every deeper step.
     const int centerX =
         baseX + depth * TreeIndentPixels() + TreeIndentPixels() / 2;
     return centerX - TreeBoxSizePixels() / 2;
