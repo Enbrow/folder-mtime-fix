@@ -1,0 +1,33 @@
+name: Sync Release Notes
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "release-notes/*.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-release-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Sync notes to existing releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          for file in release-notes/*.md; do
+            tag="$(basename "$file" .md)"
+            if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              gh release edit "$tag" \
+                --repo "${{ github.repository }}" \
+                --notes-file "$file"
+            fi
+          done
