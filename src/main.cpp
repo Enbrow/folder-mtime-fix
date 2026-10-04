@@ -89,6 +89,7 @@ struct FsNode {
     std::wstring name;
     std::wstring type;
     std::wstring scanError;
+    std::wstring referenceSourceName;
     FILETIME lastWrite{};
     FILETIME targetTime{};
     bool hasTarget = false;
@@ -689,6 +690,10 @@ void ApplyResultToNodes(FsNode* node, const fmtfix::Result& result) {
             if (entry.hasTarget) {
                 node->targetTime = entry.target;
             }
+            if (!entry.sourcePath.empty()) {
+                node->referenceSourceName =
+                    RootDisplayName(entry.sourcePath);
+            }
         }
         if (!entry.sourcePath.empty() && entry.sourcePath == node->path) {
             node->isReference = true;
@@ -714,6 +719,14 @@ std::wstring NodeRemark(const FsNode& node) {
             remark += L"；";
         }
         remark += node.scanError;
+    }
+    if (node.isDirectory &&
+        node.willChange &&
+        !node.referenceSourceName.empty()) {
+        if (!remark.empty()) {
+            remark += L"；";
+        }
+        remark += L"参考\"" + node.referenceSourceName + L"\"";
     }
     if (node.isReference) {
         if (!remark.empty()) {
