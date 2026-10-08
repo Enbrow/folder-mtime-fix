@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "mtime_core.h"
+#include "tree_grid_logic.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -705,35 +706,6 @@ std::wstring RootDisplayName(const std::wstring& root) {
         return trimmed;
     }
     return trimmed.substr(slash + 1);
-}
-
-void ApplyResultToNodes(FsNode* node, const fmtfix::Result& result) {
-    if (node == nullptr) {
-        return;
-    }
-
-    for (const auto& entry : result.entries) {
-        if (entry.directory == node->path) {
-            node->willChange =
-                entry.status == fmtfix::EntryStatus::WouldChange ||
-                entry.status == fmtfix::EntryStatus::Changed;
-            node->hasTarget = entry.hasTarget;
-            if (entry.hasTarget) {
-                node->targetTime = entry.target;
-            }
-            if (!entry.sourcePath.empty()) {
-                node->referenceSourceName =
-                    RootDisplayName(entry.sourcePath);
-            }
-        }
-        if (!entry.sourcePath.empty() && entry.sourcePath == node->path) {
-            node->isReference = true;
-        }
-    }
-
-    for (auto& child : node->children) {
-        ApplyResultToNodes(child.get(), result);
-    }
 }
 
 int CompareTextNoCase(const std::wstring& a, const std::wstring& b) {
@@ -1614,13 +1586,7 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
                   : L"正在修改并重新扫描目录，请稍候...");
     UpdateWindow(owner);
 
-    for (auto it = gExcludedPaths.begin(); it != gExcludedPaths.end();) {
-        if (!fmtfix::IsPathInside(*it, root)) {
-            it = gExcludedPaths.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    treegrid::RetainProperDescendantExclusions(gExcludedPaths, root);
     gExpandedPaths.insert(root);
 
     const fmtfix::Result result =
@@ -1637,7 +1603,7 @@ void RunOperation(HWND owner, fmtfix::Mode mode) {
         root,
         RootDisplayName(root),
         nullptr);
-    ApplyResultToNodes(gRootNode.get(), result);
+    treegrid::ApplyResultToNodes(gRootNode.get(), result, RootDisplayName);
     RebuildTreeGrid();
     PopulateChangeList(result);
     UpdateRootSummary();

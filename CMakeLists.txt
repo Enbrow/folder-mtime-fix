@@ -56,3 +56,17 @@ if(MSVC)
 endif()
 
 add_test(NAME FolderMTimeFixTests COMMAND FolderMTimeFixTests)
+
+add_executable(FolderMTimeFixTreeGridTests
+    tests/test_tree_grid_logic.cpp
+)
+target_link_libraries(FolderMTimeFixTreeGridTests PRIVATE mtime_core)
+target_compile_definitions(FolderMTimeFixTreeGridTests PRIVATE
+    UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+
+if(MSVC)
+    target_compile_options(FolderMTimeFixTreeGridTests PRIVATE
+        /W4 /permissive- /utf-8 /EHsc)
+endif()
+
+add_test(NAME FolderMTimeFixTreeGridTests COMMAND FolderMTimeFixTreeGridTests)

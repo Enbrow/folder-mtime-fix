@@ -8,10 +8,12 @@
 #include <cstdlib>
 #include <cwchar>
 #include <iostream>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "mtime_core.h"
+#include "tree_grid_logic.h"
 
 namespace {
 
@@ -344,6 +346,50 @@ int wmain() {
             combinedExcludedParent->hasTarget &&
             EqualTime(combinedExcludedParent->target, t2023),
         "Unchecked mode must behave the same when the parent has no files");
+
+    // Scenario 6: manually changing the root path to a previously excluded
+    // child must not leave that newly selected root excluded.
+    const std::wstring SwitchRoot = Join(temp.path, L"SwitchRoot");
+    const std::wstring SwitchChild = Join(SwitchRoot, L"SwitchChild");
+    const std::wstring SwitchFile = Join(SwitchChild, L"file.txt");
+    MakeDir(SwitchRoot); MakeDir(SwitchChild); MakeFile(SwitchFile);
+    SetPathTime(SwitchFile, t2025, false);
+    SetPathTime(SwitchChild, t2023, true);
+
+    std::set<std::wstring> switchExclusions{SwitchChild};
+    const auto beforeSwitch = fmtfix::ProcessTree(
+        SwitchRoot, fmtfix::Mode::DryRun, {SwitchChild});
+    ok &= Expect(FindEntry(beforeSwitch, SwitchChild) == nullptr,
+                 "Excluded child should not be processed under old root");
+
+    treegrid::RetainProperDescendantExclusions(
+        switchExclusions, SwitchChild);
+    ok &= Expect(switchExclusions.empty(),
+                 "Selecting excluded child as new root must clear its exclusion");
+
+    const std::vector<std::wstring> activeExclusions(
+        switchExclusions.begin(), switchExclusions.end());
+    const auto previewAfterSwitch = fmtfix::ProcessTree(
+        SwitchChild, fmtfix::Mode::DryRun, activeExclusions);
+    const auto* switchedPreviewEntry =
+        FindEntry(previewAfterSwitch, SwitchChild);
+    FILETIME previewChildTime{};
+    GetPathTime(SwitchChild, previewChildTime);
+    ok &= Expect(
+        switchedPreviewEntry && switchedPreviewEntry->hasTarget &&
+            EqualTime(switchedPreviewEntry->target, t2025) &&
+            EqualTime(previewChildTime, t2023),
+        "New root Dry Run must calculate a target without modifying it");
+
+    const auto appliedAfterSwitch = fmtfix::ProcessTree(
+        SwitchChild, fmtfix::Mode::Apply, activeExclusions);
+    FILETIME appliedChildTime{};
+    GetPathTime(SwitchChild, appliedChildTime);
+    ok &= Expect(
+        FindEntry(appliedAfterSwitch, SwitchChild) != nullptr &&
+            appliedAfterSwitch.summary.changedOrWouldChange == 1 &&
+            EqualTime(appliedChildTime, t2025),
+        "New root Apply must modify the former excluded directory");
 
     if (!ok) {
         return 1;
