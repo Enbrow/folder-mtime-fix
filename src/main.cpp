@@ -548,6 +548,22 @@ int ShellIconIndex(const std::wstring& path, bool isDirectory) {
     return images != nullptr ? info.iIcon : -1;
 }
 
+// A stock opened folder has a dedicated image-list index. On some Windows
+// versions SHGFI_OPENICON returns the same index as the closed folder, so use
+// SIID_FOLDEROPEN instead; query just once and reuse the system image list.
+int ShellOpenFolderIconIndex() {
+    static const int index = []() {
+        SHSTOCKICONINFO info{};
+        info.cbSize = sizeof(info);
+        const HRESULT hr = SHGetStockIconInfo(
+            SIID_FOLDEROPEN,
+            SHGSI_SYSICONINDEX | SHGSI_SMALLICON,
+            &info);
+        return SUCCEEDED(hr) ? info.iSysImageIndex : -1;
+    }();
+    return index;
+}
+
 bool IsExcludedPath(const std::wstring& path) {
     for (const auto& excluded : gExcludedPaths) {
         if (fmtfix::IsPathInside(path, excluded)) {
@@ -1330,36 +1346,46 @@ LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
 
             const int midX = (box.left + box.right) / 2;
             const int midY = (box.top + box.bottom) / 2;
-            // Distinct directional glyphs fit the original compact box.
-            const int r = std::max(2, boxSize / 4);
-            POINT triangle[3]{};
-            if (node->expanded) {
-                triangle[0] = POINT{midX - r, midY - r / 2};
-                triangle[1] = POINT{midX + r, midY - r / 2};
-                triangle[2] = POINT{midX, midY + r};
+            if (!node->expanded) {
+                // Restore the original '+' mark for collapsed folders.
+                MoveToEx(draw->nmcd.hdc, box.left + 2, midY, nullptr);
+                LineTo(draw->nmcd.hdc, box.right - 2, midY);
+                MoveToEx(draw->nmcd.hdc, midX, box.top + 2, nullptr);
+                LineTo(draw->nmcd.hdc, midX, box.bottom - 2);
             } else {
-                triangle[0] = POINT{midX - r / 2, midY - r};
-                triangle[1] = POINT{midX + r, midY};
-                triangle[2] = POINT{midX - r / 2, midY + r};
+                // Keep the filled down triangle for expanded folders.
+                const int r = std::max(2, boxSize / 4);
+                POINT triangle[3]{
+                    POINT{midX - r, midY - r / 2},
+                    POINT{midX + r, midY - r / 2},
+                    POINT{midX, midY + r}};
+                const COLORREF glyph = selected
+                    ? GetSysColor(COLOR_HIGHLIGHTTEXT)
+                    : GetSysColor(COLOR_WINDOWTEXT);
+                HBRUSH glyphBrush = CreateSolidBrush(glyph);
+                HGDIOBJ oldBrush = SelectObject(draw->nmcd.hdc, glyphBrush);
+                HGDIOBJ oldPen = SelectObject(
+                    draw->nmcd.hdc, GetStockObject(NULL_PEN));
+                Polygon(draw->nmcd.hdc, triangle, 3);
+                SelectObject(draw->nmcd.hdc, oldPen);
+                SelectObject(draw->nmcd.hdc, oldBrush);
+                DeleteObject(glyphBrush);
             }
-            const COLORREF glyph = selected
-                ? GetSysColor(COLOR_HIGHLIGHTTEXT)
-                : GetSysColor(COLOR_WINDOWTEXT);
-            HBRUSH glyphBrush = CreateSolidBrush(glyph);
-            HGDIOBJ oldBrush = SelectObject(draw->nmcd.hdc, glyphBrush);
-            HGDIOBJ oldPen = SelectObject(draw->nmcd.hdc, GetStockObject(NULL_PEN));
-            Polygon(draw->nmcd.hdc, triangle, 3);
-            SelectObject(draw->nmcd.hdc, oldPen);
-            SelectObject(draw->nmcd.hdc, oldBrush);
-            DeleteObject(glyphBrush);
         }
         x += boxSize + ScaleForDpi(gTreeGrid, 5);
 
         const int iconSize = ScaleForDpi(gTreeGrid, 16);
-        if (gSystemImageList != nullptr && node->iconIndex >= 0) {
+        int iconIndex = node->iconIndex;
+        if (node->isDirectory && node->expanded && !node->children.empty()) {
+            const int openIconIndex = ShellOpenFolderIconIndex();
+            if (openIconIndex >= 0) {
+                iconIndex = openIconIndex;
+            }
+        }
+        if (gSystemImageList != nullptr && iconIndex >= 0) {
             ImageList_Draw(
                 gSystemImageList,
-                node->iconIndex,
+                iconIndex,
                 draw->nmcd.hdc,
                 x,
                 rect.top + (rect.bottom - rect.top - iconSize) / 2,
