@@ -70,3 +70,16 @@ if(MSVC)
 endif()
 
 add_test(NAME FolderMTimeFixTreeGridTests COMMAND FolderMTimeFixTreeGridTests)
+
+# Render actual Windows Shell closed-folder icon and the application's
+# expanded-folder drawing helper, then verify visibly different pixels.
+add_executable(FolderMTimeFixIconTests tests/test_tree_grid_icons.cpp)
+target_include_directories(FolderMTimeFixIconTests PRIVATE src)
+target_compile_definitions(FolderMTimeFixIconTests PRIVATE
+    UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(FolderMTimeFixIconTests PRIVATE shell32 user32 gdi32)
+if(MSVC)
+    target_compile_options(FolderMTimeFixIconTests PRIVATE
+        /W4 /permissive- /utf-8 /EHsc)
+endif()
+add_test(NAME FolderMTimeFixIconTests COMMAND FolderMTimeFixIconTests)
