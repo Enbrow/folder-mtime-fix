@@ -858,9 +858,22 @@ void FlattenVisibleNodes(FsNode* node) {
     }
 }
 
-void RebuildTreeGrid() {
+void RebuildTreeGrid(bool preserveViewport = false) {
     if (gTreeGrid == nullptr) {
         return;
+    }
+
+    FsNode* topNode = nullptr;
+    int topY = 0;
+    if (preserveViewport && !gVisibleNodes.empty()) {
+        const int top = ListView_GetTopIndex(gTreeGrid);
+        if (top >= 0 && static_cast<size_t>(top) < gVisibleNodes.size()) {
+            topNode = gVisibleNodes[static_cast<size_t>(top)];
+            RECT rc{};
+            if (ListView_GetItemRect(gTreeGrid, top, &rc, LVIR_BOUNDS)) {
+                topY = rc.top;
+            }
+        }
     }
 
     SendMessageW(gTreeGrid, WM_SETREDRAW, FALSE, 0);
@@ -913,6 +926,27 @@ void RebuildTreeGrid() {
         ListView_SetItemText(
             gTreeGrid, row, 6,
             const_cast<LPWSTR>(remark.c_str()));
+    }
+
+    if (preserveViewport && topNode != nullptr && !gVisibleNodes.empty()) {
+        FsNode* anchor = topNode;
+        int row = -1;
+        while (anchor != nullptr && row < 0) {
+            const auto it = std::find(gVisibleNodes.begin(),
+                                      gVisibleNodes.end(), anchor);
+            if (it != gVisibleNodes.end()) {
+                row = static_cast<int>(it - gVisibleNodes.begin());
+            } else {
+                anchor = anchor->parent;
+            }
+        }
+        if (row >= 0) {
+            ListView_EnsureVisible(gTreeGrid, row, FALSE);
+            RECT rect{};
+            if (ListView_GetItemRect(gTreeGrid, row, &rect, LVIR_BOUNDS)) {
+                ListView_Scroll(gTreeGrid, 0, rect.top - topY);
+            }
+        }
     }
 
     SendMessageW(gTreeGrid, WM_SETREDRAW, TRUE, 0);
@@ -1296,12 +1330,28 @@ LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
 
             const int midX = (box.left + box.right) / 2;
             const int midY = (box.top + box.bottom) / 2;
-            MoveToEx(draw->nmcd.hdc, box.left + 2, midY, nullptr);
-            LineTo(draw->nmcd.hdc, box.right - 2, midY);
-            if (!node->expanded) {
-                MoveToEx(draw->nmcd.hdc, midX, box.top + 2, nullptr);
-                LineTo(draw->nmcd.hdc, midX, box.bottom - 2);
+            // Distinct directional glyphs fit the original compact box.
+            const int r = std::max(2, boxSize / 4);
+            POINT triangle[3]{};
+            if (node->expanded) {
+                triangle[0] = POINT{midX - r, midY - r / 2};
+                triangle[1] = POINT{midX + r, midY - r / 2};
+                triangle[2] = POINT{midX, midY + r};
+            } else {
+                triangle[0] = POINT{midX - r / 2, midY - r};
+                triangle[1] = POINT{midX + r, midY};
+                triangle[2] = POINT{midX - r / 2, midY + r};
             }
+            const COLORREF glyph = selected
+                ? GetSysColor(COLOR_HIGHLIGHTTEXT)
+                : GetSysColor(COLOR_WINDOWTEXT);
+            HBRUSH glyphBrush = CreateSolidBrush(glyph);
+            HGDIOBJ oldBrush = SelectObject(draw->nmcd.hdc, glyphBrush);
+            HGDIOBJ oldPen = SelectObject(draw->nmcd.hdc, GetStockObject(NULL_PEN));
+            Polygon(draw->nmcd.hdc, triangle, 3);
+            SelectObject(draw->nmcd.hdc, oldPen);
+            SelectObject(draw->nmcd.hdc, oldBrush);
+            DeleteObject(glyphBrush);
         }
         x += boxSize + ScaleForDpi(gTreeGrid, 5);
 
@@ -1402,7 +1452,7 @@ void ToggleTreeNode(int row) {
     } else {
         gExpandedPaths.erase(node->path);
     }
-    RebuildTreeGrid();
+    RebuildTreeGrid(true);
 }
 
 void SetSubtreeExpanded(FsNode* node, bool expanded) {
@@ -2202,11 +2252,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     ShowTreeContextMenu(hwnd, node, pt);
                 if (command == IDM_EXPAND_ALL && node != nullptr) {
                     SetSubtreeExpanded(node, true);
-                    RebuildTreeGrid();
+                    RebuildTreeGrid(true);
                 } else if (command == IDM_COLLAPSE_ALL &&
                            node != nullptr) {
                     SetSubtreeExpanded(node, false);
-                    RebuildTreeGrid();
+                    RebuildTreeGrid(true);
                 } else if (command == IDM_EXCLUDE &&
                            node != nullptr &&
                            node->isDirectory &&
