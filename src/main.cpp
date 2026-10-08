@@ -20,6 +20,7 @@
 
 #include "mtime_core.h"
 #include "tree_grid_logic.h"
+#include "tree_grid_icons.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -546,22 +547,6 @@ int ShellIconIndex(const std::wstring& path, bool isDirectory) {
         }
     }
     return images != nullptr ? info.iIcon : -1;
-}
-
-// A stock opened folder has a dedicated image-list index. On some Windows
-// versions SHGFI_OPENICON returns the same index as the closed folder, so use
-// SIID_FOLDEROPEN instead; query just once and reuse the system image list.
-int ShellOpenFolderIconIndex() {
-    static const int index = []() {
-        SHSTOCKICONINFO info{};
-        info.cbSize = sizeof(info);
-        const HRESULT hr = SHGetStockIconInfo(
-            SIID_FOLDEROPEN,
-            SHGSI_SYSICONINDEX | SHGSI_SMALLICON,
-            &info);
-        return SUCCEEDED(hr) ? info.iSysImageIndex : -1;
-    }();
-    return index;
 }
 
 bool IsExcludedPath(const std::wstring& path) {
@@ -1375,20 +1360,20 @@ LRESULT HandleTreeGridCustomDraw(NMLVCUSTOMDRAW* draw) {
         x += boxSize + ScaleForDpi(gTreeGrid, 5);
 
         const int iconSize = ScaleForDpi(gTreeGrid, 16);
-        int iconIndex = node->iconIndex;
-        if (node->isDirectory && node->expanded && !node->children.empty()) {
-            const int openIconIndex = ShellOpenFolderIconIndex();
-            if (openIconIndex >= 0) {
-                iconIndex = openIconIndex;
-            }
-        }
-        if (gSystemImageList != nullptr && iconIndex >= 0) {
+        const int iconY =
+            rect.top + (rect.bottom - rect.top - iconSize) / 2;
+        if (treegrid::UseOpenFolderIcon(
+                node->isDirectory, node->expanded, !node->children.empty())) {
+            // Windows 11 may render the system's "open" and "closed"
+            // stock folder icons identically. Draw an explicitly open folder.
+            treegrid::DrawOpenFolderIcon(draw->nmcd.hdc, x, iconY, iconSize);
+        } else if (gSystemImageList != nullptr && node->iconIndex >= 0) {
             ImageList_Draw(
                 gSystemImageList,
-                iconIndex,
+                node->iconIndex,
                 draw->nmcd.hdc,
                 x,
-                rect.top + (rect.bottom - rect.top - iconSize) / 2,
+                iconY,
                 ILD_TRANSPARENT);
         }
         x += iconSize + ScaleForDpi(gTreeGrid, 5);
